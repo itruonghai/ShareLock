@@ -17,7 +17,7 @@ class Projection(nn.Module):
                 layers.append(nn.Linear(input_size, hidden_size))
                 layers.append(nn.BatchNorm1d(hidden_size))
                 layers.append(nn.ReLU())
-                layers.append(nn.Dropout(0.2))
+                layers.append(nn.Dropout(getattr(config, 'dropout', 0.2)))
                 input_size = hidden_size
             layers.append(nn.Linear(input_size, embedding_size))
             self.projection = nn.Sequential(*layers)
@@ -104,7 +104,11 @@ class QFormerProjector(nn.Module):
         num_layers = getattr(config, 'num_transformer_layers', 2)
         dropout = getattr(config, 'dropout', 0.1)
 
-        self.input_proj = nn.Linear(input_size, hidden_size)
+        self.input_norm = nn.BatchNorm1d(input_size)
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.GELU(),
+        )
         self.queries = nn.Parameter(torch.randn(1, num_queries, hidden_size) * 0.02)
         self.layers = nn.ModuleList([
             _QFormerLayer(hidden_size, num_heads, dropout) for _ in range(num_layers)
@@ -114,8 +118,8 @@ class QFormerProjector(nn.Module):
     def forward(self, x):
         B = x.shape[0]
         # context: single token from input features
-        ctx = self.input_proj(x).unsqueeze(1)           # [B, 1, hidden]
-        q = self.queries.expand(B, -1, -1)              # [B, num_queries, hidden]
+        ctx = self.input_proj(self.input_norm(x)).unsqueeze(1)  # [B, 1, hidden]
+        q = self.queries.expand(B, -1, -1)                     # [B, num_queries, hidden]
         for layer in self.layers:
             q = layer(q, ctx)
         pooled = q.mean(dim=1)                          # [B, hidden]

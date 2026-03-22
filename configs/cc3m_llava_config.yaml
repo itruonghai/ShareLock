@@ -21,6 +21,7 @@ model:
     hidden_size: 4096
     num_layers: 4
     normalize: True
+    dropout: 0.1
 
 training:
   max_steps: 5000
@@ -33,6 +34,7 @@ training:
   weight_decay: 0.0001
   early_stopping: True
   early_stopping_patience: 50
+  early_stopping_min_delta: 0.001
   num_gpus: 2
 
 skip_test: true

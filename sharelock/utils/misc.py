@@ -23,8 +23,7 @@ feature_dimensions_language = {
     "meta-llama/Meta-Llama-3-8B": 4096,
 }
 
-def loss(logits, target):
-    logit_scale = torch.tensor(2.6592).exp()
+def loss(logits, target, logit_scale):
     similarities = logit_scale * logits @ target.T
     return clip_loss(similarities)
 

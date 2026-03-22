@@ -19,10 +19,42 @@ def _load_features_parallel(feature_utils, ids, feature_names, num_workers=16):
     return {name: torch.stack([r[name].squeeze() for r in results]) for name in feature_names}
 
 
+def _tensor_cache_path(config, split):
+    """Return a stable path for the pre-built tensor cache for a given split."""
+    caption_files = config.data.caption_files
+    if isinstance(caption_files, str):
+        caption_files = [caption_files]
+    caption_tag = "+".join(f.replace(".json", "") for f in sorted(caption_files))
+    vis = config.model.vision_encoder.split("/")[-1]
+    lang = config.model.language_encoder.split("/")[-1]
+    filename = (
+        f"{config.data.dataset}__{vis}__{lang}__{caption_tag}"
+        f"__{split}_seed{config.seed}_val{config.data.val_split_num}.pt"
+    ).replace("/", "-")
+    cache_dir = os.path.join(config.data.precomputed_features_dir, "_tensor_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, filename)
+
+
 class VisionLanguageFeatureDataset(Dataset):
     def __init__(self, config, split):
         self.config = config.copy()
         self.split = split
+
+        # Normalise caption_files to a list early so cache key is consistent
+        self.config.data.caption_files = (
+            [self.config.data.caption_files]
+            if isinstance(self.config.data.caption_files, str)
+            else list(self.config.data.caption_files)
+        )
+
+        cache_path = _tensor_cache_path(self.config, split)
+        if os.path.exists(cache_path):
+            print(f"Loading {split} tensors from cache ({cache_path})...", flush=True)
+            cached = torch.load(cache_path, weights_only=True)
+            self.vision_tensor = cached["vision"]
+            self.language_tensors = cached["language"]
+            return
 
         data_staging_dir = os.environ.get("TMPDIR", None)
         rng = random.Random(self.config.seed)
@@ -49,7 +81,6 @@ class VisionLanguageFeatureDataset(Dataset):
         del image_features
 
         # Loading precomputed language features for each caption file (randomly select caption at each iteration)
-        self.config.data.caption_files = [self.config.data.caption_files] if isinstance(self.config.data.caption_files, str) else self.config.data.caption_files
         self.language_tensors = []
         for caption_file in self.config.data.caption_files:
             feature_dir = f"{self.config.data.precomputed_features_dir}/{self.config.data.dataset}/{self.config.model.language_encoder.split('/')[-1]}/{caption_file.replace('.json', '')}"
@@ -61,6 +92,9 @@ class VisionLanguageFeatureDataset(Dataset):
             loaded = _load_features_parallel(language_features, feature_ids, ["language_features"])
             self.language_tensors.append(loaded["language_features"])  # [N, language_dim]
             del language_features
+
+        print(f"Saving {split} tensor cache to {cache_path}...", flush=True)
+        torch.save({"vision": self.vision_tensor, "language": self.language_tensors}, cache_path)
 
     def __len__(self):
         return len(self.vision_tensor)

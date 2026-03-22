@@ -1,5 +1,5 @@
 seed: 42
-experiment_name: "cc3m_nv_former"
+experiment_name: "cc3m_mlp_10k"
 
 data:
   dataset: "llava-filtered-cc3m-595k"
@@ -18,15 +18,14 @@ model:
     normalize: True
   language_encoder: "meta-llama/Meta-Llama-3-8B"
   language_projector:
-    type: nv_former
-    hidden_size: 512
-    num_queries: 32
-    num_heads: 8
+    hidden_size: 4096
+    num_layers: 4
     normalize: True
+    dropout: 0.1
 
 training:
-  max_steps: 5000
-  lr_warmup_steps: 150
+  max_steps: 10000
+  lr_warmup_steps: 300
   learning_rate: 0.001
   lr_schedule: "cosine"
   batch_size: 32768
@@ -34,14 +33,11 @@ training:
   max_grad_norm: 1
   weight_decay: 0.0001
   early_stopping: True
-  early_stopping_patience: 50
+  early_stopping_patience: 100
   early_stopping_min_delta: 0.001
   num_gpus: 2
 
 skip_test: true
-run_eval_after_train: true
-eval_batch_size: 512
-eval_num_workers: 8
 
 logging:
   save_dir: "logs/"

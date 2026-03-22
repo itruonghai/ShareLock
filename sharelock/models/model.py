@@ -19,6 +19,7 @@ class ShareLock(pl.LightningModule):
         
         
         self.loss = loss
+        self.logit_scale = nn.Parameter(torch.tensor(2.6592))
         
         # Setup of projection layers
         try:
@@ -51,15 +52,17 @@ class ShareLock(pl.LightningModule):
         return image_features_projected, langauge_features_projected
     
     def training_step(self, batch: dict, batch_idx: int):
+        self.logit_scale.data.clamp_(0, 4.6052)
         image_features_projected, langauge_features_projected = self(batch)
-        loss = self.loss(image_features_projected, langauge_features_projected)
-        
+        loss = self.loss(image_features_projected, langauge_features_projected, self.logit_scale.exp())
+
         self.log('train_loss', loss, prog_bar=True)
+        self.log('logit_scale', self.logit_scale.exp(), prog_bar=False)
         return loss
 
     def validation_step(self, batch: dict, batch_idx: int):
         image_features_projected, langauge_features_projected = self(batch)
-        loss = self.loss(image_features_projected, langauge_features_projected)
+        loss = self.loss(image_features_projected, langauge_features_projected, self.logit_scale.exp())
 
         self.log(f"validation_loss", loss, prog_bar=True)
         return loss

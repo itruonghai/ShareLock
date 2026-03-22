@@ -19,7 +19,7 @@ model:
   language_encoder: "meta-llama/Meta-Llama-3-8B"
   language_projector:
     type: qformer
-    hidden_size: 512
+    hidden_size: 1024
     num_queries: 32
     num_heads: 8
     num_transformer_layers: 2
@@ -37,6 +37,7 @@ training:
   weight_decay: 0.0001
   early_stopping: True
   early_stopping_patience: 50
+  early_stopping_min_delta: 0.001
   num_gpus: 2
 
 skip_test: true

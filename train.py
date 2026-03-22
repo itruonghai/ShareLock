@@ -74,10 +74,11 @@ if __name__ == "__main__":
     )
     callbacks.append(checkpointing)
     if config.training.early_stopping:
+        min_delta = config.training.get("early_stopping_min_delta", 0.001)
         callbacks.append(EarlyStopping(
             monitor="validation_loss",
             patience=config.training.early_stopping_patience,
-            min_delta=0.1,
+            min_delta=min_delta,
             mode="min",
         ))
     
@@ -89,6 +90,9 @@ if __name__ == "__main__":
     print("Loading trainer")
     num_gpus = config.training.get("num_gpus", 1)
     precision = config.training.get("precision", "bf16-mixed")
+    # Disable rich progress bar when stdout is redirected (e.g. tee to file)
+    # so that tail -f shows clean line-by-line output instead of ANSI escape codes.
+    enable_progress_bar = sys.stdout.isatty()
     trainer = pl.Trainer(
         logger=logger,
         max_steps=config.training.max_steps,
@@ -101,6 +105,7 @@ if __name__ == "__main__":
         devices=num_gpus,
         strategy="ddp" if num_gpus > 1 else "auto",
         precision=precision,
+        enable_progress_bar=enable_progress_bar,
         )
     
     if args.eval_only:
