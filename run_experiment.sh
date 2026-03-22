@@ -51,8 +51,7 @@ if [[ -n "$EVAL_ONLY" ]]; then
         --checkpoint "$EVAL_ONLY" \
         --config "$CONFIG" \
         --batch_size "$EVAL_BATCH_SIZE" \
-        --num_workers "$EVAL_WORKERS" \
-        --streaming
+        --num_workers "$EVAL_WORKERS"
     exit $?
 fi
 

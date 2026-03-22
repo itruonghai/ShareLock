@@ -61,27 +61,84 @@ Published in **Transactions on Machine Learning Research (TMLR) 01/2026**
 
 ## 📦 Usage
 
+### Quick Start: Train + Evaluate
+
+The `run_experiment.sh` script handles the full pipeline (training → evaluation) in one command:
+
+```bash
+# Train and auto-evaluate on ImageNet-1k zero-shot
+./run_experiment.sh --config configs/cc3m_llava_config.yaml --gpu 0
+
+# Use a specific GPU
+./run_experiment.sh --config configs/cc3m_llava_config.yaml --gpu 1
+
+# Evaluate an existing checkpoint (no training)
+./run_experiment.sh --eval-only checkpoints/ShareLock-CC3M.ckpt \
+    --config configs/cc3m_llava_config.yaml
+
+# Train with 2 GPUs (DDP) — call train.py directly
+CUDA_VISIBLE_DEVICES=0,1 python train.py --config configs/cc3m_nv_former.yaml
+```
+
+Monitor training progress via TensorBoard:
+```bash
+tensorboard --logdir logs/ --port 6006
+```
+
+### Step-by-Step
+
 0. **Download Datasets**:
-    Training and validation of the model requires the presence of paired image-caption data. Popular small-scale datasets include CC3M, CC12M and YFCC15M and can be downlaoded in webdataset format using the [img2dataset](https://github.com/rom1504/img2dataset/) library.
+    Training and validation of the model requires the presence of paired image-caption data. Popular small-scale datasets include CC3M, CC12M and YFCC15M and can be downloaded in webdataset format using the [img2dataset](https://github.com/rom1504/img2dataset/) library.
 
 1. **Precompute Features**:
     Use pretrained models to extract vision and text embeddings:
     ```bash
-    python precompute_image_features_hf.py # Hugginface datasets for classification tasks (test of final model)
-    python precompute_image_features_wds.py # Image-caption datasets in webdataset format (training and validation)
-    python precompute_language_features.py # JSON file containing caption for each uid in image dataset
+    python precompute_image_features_hf.py  # HuggingFace datasets for classification tasks (test)
+    python precompute_image_features_wds.py  # Image-caption datasets in webdataset format (train/val)
+    python precompute_language_features.py   # JSON file with captions for each uid in image dataset
     ```
-    The dataset and backbone model to be used can be configured in the respective files via command line arguments. The precomputed features will be stored via the FeatureUtils library. The presence of a json file with iamge *uids* as keys and the corresponding captions as values is assumed. This information is consequently read and processed by the `precompute_language_features.py` script. 
+    The dataset and backbone model can be configured via command line arguments. The presence of a JSON file with image *uids* as keys and corresponding captions as values is assumed.
 
 2. **Train the Projection Network**:
-    The image and text features are aligned by running:
     ```bash
-    python train.py
+    python train.py --config configs/cc3m_llava_config.yaml
     ```
-    Settings and hyperparameters can be specified or changed in ```configs/default_config.yaml```.
+    Configs for different projector architectures are provided in `configs/`:
 
-3. **Evaluate Model on VLM Taks**:
-    The ShareLock class implements the ```encode_text``` and ```encode_image``` functions which can be used for inference on downstream vision-language modeling tasks.
+    | Config | Projector | ImageNet-1k Top-1 |
+    |---|---|---|
+    | `cc3m_llava_config.yaml` | MLP (4-layer, BatchNorm) | 49.95% |
+    | `cc3m_qformer.yaml` | QFormer (2L, 32 queries) | 48.72% |
+    | `cc3m_nv_former.yaml` | NV-Former (1L, 32 queries) | 42.80% |
+    | `cc3m_mlp_v2.yaml` | MLPv2 (LayerNorm + GELU) | 41.75% |
+
+3. **Zero-Shot ImageNet-1k Evaluation**:
+    ```bash
+    python eval_zero_shot_imagenet.py \
+        --checkpoint logs/<experiment>/version_X/checkpoints/best_model.ckpt \
+        --config configs/cc3m_llava_config.yaml
+    ```
+    Class prototype embeddings are cached automatically (as `<checkpoint>_protos_openai_80tmpl.pt`),
+    making repeated evaluations fast (~50 sec image eval after the initial ~1:30 min Llama encoding).
+
+    To benchmark all checkpoints across 2 GPUs in parallel:
+    ```bash
+    ./run_all_evals.sh
+    ```
+
+4. **Inference**:
+    The `ShareLock` class implements `encode_text` and `encode_image` for downstream VLM tasks:
+    ```python
+    from sharelock.models.model import ShareLock
+    from omegaconf import OmegaConf
+
+    config = OmegaConf.load("configs/cc3m_llava_config.yaml")
+    model = ShareLock.load_from_checkpoint("checkpoints/ShareLock-CC3M.ckpt", config=config)
+    model.eval()
+
+    image_emb = model.encode_image(image)   # [D]
+    text_emb  = model.encode_text("a photo of a cat")  # [D]
+    ```
 
 ---
 
@@ -105,7 +162,9 @@ Alternatively, the `--checkpoint` flag can be passed to the `train.py` file.
 
 ## 📊 Results
 
-Our reported results were obtained via the [CLIP-Benchmark](https://github.com/LAION-AI/CLIP_benchmark/tree/main) codebase. A subset of classification results in presented in the following table:
+### Paper Results
+
+Our reported results were obtained via the [CLIP-Benchmark](https://github.com/LAION-AI/CLIP_benchmark/tree/main) codebase. A subset of classification results is presented in the following table:
 
 **Zero-shot classification on ImageNet variants:**
 
@@ -119,6 +178,24 @@ Our reported results were obtained via the [CLIP-Benchmark](https://github.com/L
 | [**ShareLock**](https://arxiv.org/abs/2410.07173) | CC12M           | **62.0%** | 78.5% | **70.1%** |
 
 For a comprehensive and detailed evaluation of ShareLock across various vision-language-modelling tasks, see [our paper](https://arxiv.org/pdf/2410.07173).
+
+### Reproduced Results (Zero-Shot ImageNet-1k)
+
+Evaluated using 80-template CLIP ensemble + OpenAI curated class names on 50K validation images.
+All runs on a single NVIDIA RTX PRO 6000 Blackwell (97 GB), batch size 512.
+
+| Checkpoint | Projector | Top-1 | Top-5 |
+|---|---|---|---|
+| `ShareLock-CC3M.ckpt` (published) | MLP 4-layer + BatchNorm | **51.47%** | **81.29%** |
+| `cc3m_llava` (best trained run) | MLP 4-layer + BatchNorm | 49.95% | 79.51% |
+| `cc3m_qformer` | QFormer (2L, 32 queries) | 48.72% | 78.41% |
+| `cc3m_nv_former` | NV-Former (1L, 32 queries) | 42.80% | 73.91% |
+| `cc3m_mlp_v2` | MLPv2 (LayerNorm + GELU) | 41.75% | 73.36% |
+
+> The ~3% gap to the paper's 54.5% is attributed to checkpoint quality differences; the evaluation
+> protocol (templates, class names, transforms) matches CLIP-Benchmark exactly.
+
+See [`BENCHMARK_RESULTS.md`](BENCHMARK_RESULTS.md) for full details including timing and training summaries.
 
 ---
 
