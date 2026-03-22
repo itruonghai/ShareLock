@@ -1,0 +1,49 @@
+seed: 42
+experiment_name: "cc3m_nv_former"
+
+data:
+  dataset: "llava-filtered-cc3m-595k"
+  caption_files: ["captions.json"]
+  num_workers: 16
+  val_split_num: 50000
+  precomputed_features_dir: "precomputed_features"
+  dataset_dir: "datasets"
+
+model:
+  embedding_space_dim: 768
+  vision_encoder: "dinov2_vitb14"
+  vision_projector:
+    hidden_size: 4096
+    num_layers: 0
+    normalize: True
+  language_encoder: "meta-llama/Meta-Llama-3-8B"
+  language_projector:
+    type: nv_former
+    hidden_size: 512
+    num_queries: 32
+    num_heads: 8
+    normalize: True
+
+training:
+  max_steps: 5000
+  lr_warmup_steps: 150
+  learning_rate: 0.001
+  lr_schedule: "cosine"
+  batch_size: 32768
+  accumulate_grad_batches: 1
+  max_grad_norm: 1
+  weight_decay: 0.0001
+  early_stopping: True
+  early_stopping_patience: 50
+  num_gpus: 2
+
+skip_test: true
+run_eval_after_train: true
+eval_batch_size: 512
+eval_num_workers: 8
+
+logging:
+  save_dir: "logs/"
+  save_checkpoint: True
+  log_every_n_steps: 10
+  val_check_interval: 500

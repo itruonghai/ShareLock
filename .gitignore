@@ -1,6 +1,9 @@
 # Custom
 logs/
 *.pt
+checkpoints/
+datasets/
+precomputed_features/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

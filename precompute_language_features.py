@@ -7,8 +7,6 @@ import argparse
 from featureutils.core import FeatureUtils
 from sharelock.models.language_encoder import LanguageEncoder
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 if __name__ == "__main__":
     # Parse the arguments
     parser = argparse.ArgumentParser(description="Precompute features")
@@ -21,14 +19,18 @@ if __name__ == "__main__":
     parser.add_argument("--dataset_dir", type=str, default="datasets", help="Directory where the dataset is stored")
     parser.add_argument("--gpu_num", type=int, default=1, help="Number of GPUs being used")
     parser.add_argument("--gpu_id", type=int, default=0, help="ID of the GPU being used")
+    parser.add_argument("--batch_size", type=int, default=8192, help="Number of captions to encode per forward pass")
     args = parser.parse_args()
-    
+
+    device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")
+
     print(f"Precomputing features for dataset {args.dataset} using language model {args.language_model}")
     print(f"Computing features with {args.gpu_num} GPUs, starting at GPU {args.gpu_id}")
-    
+    print(f"Using device: {device}, batch size: {args.batch_size}")
+
     if args.model_cache_dir is None and args.cache_dir is not None:
         args.model_cache_dir = args.cache_dir
-    
+
     # Initialize the feature storage util
     output_dir = f"{args.output_dir}/{args.dataset.split('/')[-1]}/{args.language_model.split('/')[-1]}/{args.caption_file.replace('.json', '')}"
     feature_utils = FeatureUtils(base_dir=output_dir, staging_dir=args.cache_dir, feature_num=1)
@@ -39,15 +41,30 @@ if __name__ == "__main__":
 
     # Load the language model
     model = LanguageEncoder(args.language_model, cache_dir=args.model_cache_dir).to(device)
-    
+
     print(f"Number of existing features: {len(feature_utils.list_keys())}")
-    
-    # Precompute the features
-    for image_idx, (image_id, caption) in tqdm.tqdm(enumerate(captions.items()), total=len(captions)):
-        if image_idx % args.gpu_num != args.gpu_id or feature_utils.exists(image_id):
-            continue
-        
-        features = model(caption)
-        feature_utils.save_feature(image_id, language_features=features)
-        
+
+    # Collect items for this GPU (modulo distribution), skip already computed
+    items = [
+        (image_id, caption)
+        for image_idx, (image_id, caption) in enumerate(captions.items())
+        if image_idx % args.gpu_num == args.gpu_id and not feature_utils.exists(image_id)
+    ]
+    print(f"GPU {args.gpu_id}: {len(items)} captions to encode")
+
+    # Encode in batches
+    for batch_start in tqdm.tqdm(range(0, len(items), args.batch_size)):
+        batch = items[batch_start:batch_start + args.batch_size]
+        batch_ids = [item[0] for item in batch]
+        batch_captions = [item[1] for item in batch]
+
+        features = model(batch_captions)
+
+        # features shape: (N, dim) or (dim,) if N=1
+        if features.dim() == 1:
+            features = features.unsqueeze(0)
+
+        for image_id, feat in zip(batch_ids, features):
+            feature_utils.save_feature(image_id, language_features=feat.unsqueeze(0))
+
     feature_utils.save()

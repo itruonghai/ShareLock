@@ -7,7 +7,7 @@ from transformers import get_cosine_schedule_with_warmup
 
 from sharelock.models.language_encoder import LanguageEncoder
 from sharelock.models.vision_encoder import VisionEncoder
-from sharelock.models.projection import Projection
+from sharelock.models.projection import build_projector
 from sharelock.utils.misc import loss, feature_dimensions_vision, feature_dimensions_language, get_transforms
 
 class ShareLock(pl.LightningModule):
@@ -36,10 +36,10 @@ class ShareLock(pl.LightningModule):
         else:
             self.embedding_space_dim = self.config.model.embedding_space_dim
         
-        self.vision_projector = Projection(config.model.vision_projector, self.embedding_space_dim, input_size=self.image_feature_size)
+        self.vision_projector = build_projector(config.model.vision_projector, self.embedding_space_dim, input_size=self.image_feature_size)
         self.vision_encoder = None
-        
-        self.language_projector = Projection(config.model.language_projector, self.embedding_space_dim, input_size=self.language_feature_size)
+
+        self.language_projector = build_projector(config.model.language_projector, self.embedding_space_dim, input_size=self.language_feature_size)
         self.language_encoder = None
         
         self.class_prototypes = None
@@ -56,14 +56,14 @@ class ShareLock(pl.LightningModule):
         image_features_projected, langauge_features_projected = self(batch)
         loss = self.loss(image_features_projected, langauge_features_projected)
         
-        self.log('train_loss', loss)
+        self.log('train_loss', loss, prog_bar=True)
         return loss
-        
+
     def validation_step(self, batch: dict, batch_idx: int):
         image_features_projected, langauge_features_projected = self(batch)
         loss = self.loss(image_features_projected, langauge_features_projected)
-        
-        self.log(f"validation_loss", loss)
+
+        self.log(f"validation_loss", loss, prog_bar=True)
         return loss
     
         

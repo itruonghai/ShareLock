@@ -12,9 +12,6 @@ from featureutils.core import FeatureUtils
 from sharelock.models.vision_encoder import VisionEncoder
 from sharelock.utils.misc import get_transforms
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
 if __name__ == "__main__":
     # Parse the arguments
     parser = argparse.ArgumentParser(description="Precompute features")
@@ -28,12 +25,15 @@ if __name__ == "__main__":
     parser.add_argument("--gpu_num", type=int, default=1, help="Number of GPUs being used")
     parser.add_argument("--gpu_id", type=int, default=0, help="ID of the GPU being used")
     args = parser.parse_args()
-    
+
+    device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")
+
     assert args.dataset is not None, "Dataset must be provided"
     assert args.vision_model is not None, "Vision model must be provided"
-    
+
     print(f"Precomputing features for dataset {args.dataset} using vision model {args.vision_model}")
     print(f"Computing features with {args.gpu_num} GPUs, starting at GPU {args.gpu_id}")
+    print(f"Using device: {device}")
     
     # Initialize the feature storage util
     output_dir = f"{args.output_dir}/{args.dataset.split('/')[-1]}/{args.vision_model.split('/')[-1]}"
@@ -64,7 +64,7 @@ if __name__ == "__main__":
         labels = torch.tensor([hf_batch[i]["label"] for i in range(len(hf_batch))])
         return {"images": images, "labels": labels}
     
-    dataloader = DataLoader(dataset, batch_size=64, num_workers=16, collate_fn=collate_fn)
+    dataloader = DataLoader(dataset, batch_size=1024, num_workers=16, collate_fn=collate_fn)
 
     # Precompute the features
     image_id = 0

@@ -1,35 +1,41 @@
 seed: 42
-experiment_name: "base"
+experiment_name: "cc3m_llava"
+
 data:
-  dataset: ["dataset_name"]
-  caption_files: ["caption_file.json"]
+  dataset: "llava-filtered-cc3m-595k"
+  caption_files: ["captions.json"]
   num_workers: 16
   val_split_num: 50000
-  precomputed_features_dir: "/path/to/precomputed/features"
+  precomputed_features_dir: "precomputed_features"
+  dataset_dir: "datasets"
+
 model:
   embedding_space_dim: 768
-  vision_encoder: "vision_model_name"
-  vision_projector: 
+  vision_encoder: "dinov2_vitb14"
+  vision_projector:
     hidden_size: 4096
     num_layers: 0
     normalize: True
-  language_encoder: "language_model_name"
+  language_encoder: "meta-llama/Meta-Llama-3-8B"
   language_projector:
     hidden_size: 4096
     num_layers: 4
     normalize: True
+
 training:
   max_steps: 5000
   lr_warmup_steps: 150
   learning_rate: 0.001
   lr_schedule: "cosine"
-  batch_size: 1024
-  accumulate_grad_batches: 16
+  batch_size: 32768
+  accumulate_grad_batches: 1
   max_grad_norm: 1
   weight_decay: 0.0001
   early_stopping: True
   early_stopping_patience: 50
   num_gpus: 2
+
+skip_test: true
 
 logging:
   save_dir: "logs/"
