@@ -4,6 +4,7 @@ logs/
 checkpoints/
 datasets/
 precomputed_features/
+eval_logs/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

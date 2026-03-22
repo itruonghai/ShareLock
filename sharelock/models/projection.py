@@ -1,10 +1,8 @@
-import math
 import torch
 import torch.nn as nn
-import pytorch_lightning as pl
 
 
-class Projection(pl.LightningModule):
+class Projection(nn.Module):
     """Original MLP projector: Linear → BatchNorm1d → ReLU → Dropout (N layers)."""
     def __init__(self, config, embedding_size, input_size):
         super().__init__()

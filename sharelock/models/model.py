@@ -47,8 +47,6 @@ class ShareLock(pl.LightningModule):
         
     def forward(self, batch: dict):
         image_features_projected = self.vision_projector(batch["vision_features"])
-        # print(batch["language_features"].shape)
-        # exit()
         langauge_features_projected = self.language_projector(batch["language_features"].squeeze())
         return image_features_projected, langauge_features_projected
     
