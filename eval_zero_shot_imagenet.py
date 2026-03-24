@@ -6,14 +6,18 @@ Follows CLIP-Benchmark zero-shot evaluation approach:
   2. Encode validation images with DINOv2 + vision projector
   3. Classify via cosine similarity, report top-1 and top-5 accuracy
 
-Usage:
-    # Download checkpoint first (CC3M, expected ~54.5% top-1):
+Prerequisites:
+    # Download ImageNet-1k validation set (Parquet, ~6.5 GB):
+    huggingface-cli download ILSVRC/imagenet-1k --repo-type dataset \
+        --include 'data/validation*' --local-dir datasets/imagenet-1k
+
+    # Download checkpoint (CC3M, expected ~54.5% top-1):
     python -c "
     from huggingface_hub import hf_hub_download
     hf_hub_download(repo_id='FunAILab/ShareLock', filename='ShareLock-CC3M.ckpt', local_dir='checkpoints')
     "
 
-    # Run evaluation:
+Usage:
     python eval_zero_shot_imagenet.py --checkpoint checkpoints/ShareLock-CC3M.ckpt
 
     # With single custom template:
@@ -23,6 +27,7 @@ Usage:
 import torch
 import torch.serialization
 import argparse
+import glob as glob_module
 import os
 from tqdm import tqdm
 from omegaconf import OmegaConf, DictConfig, ListConfig
@@ -461,14 +466,14 @@ def main():
     parser.add_argument("--template", type=str, default=None,
                         help="Single template string, e.g. 'a photo of a {}'. "
                              "If not set, the full 80-template CLIP ensemble is used.")
-    parser.add_argument("--dataset_cache_dir", type=str, default=None,
-                        help="HuggingFace dataset cache directory")
-    parser.add_argument("--streaming", action="store_true",
-                        help="Stream imagenet-1k on-the-fly from HuggingFace (no local download needed). "
-                             "Note: forces num_workers=0, significantly slower for image loading.")
+    parser.add_argument("--imagenet_data_dir", type=str, default="datasets/imagenet-1k",
+                        help="Path to locally downloaded ImageNet-1k Parquet files. "
+                             "Download first: huggingface-cli download ILSVRC/imagenet-1k "
+                             "--repo-type dataset --include 'data/validation*' "
+                             "--local-dir datasets/imagenet-1k")
     parser.add_argument("--imagenet_dir", type=str, default=None,
                         help="Path to a local ImageNet validation folder in torchvision format "
-                             "(val/n01440764/*.JPEG ...). Use this if HuggingFace access is unavailable.")
+                             "(val/n01440764/*.JPEG ...). Overrides --imagenet_data_dir.")
     parser.add_argument("--wordnet_classnames", action="store_true",
                         help="Use raw WordNet labels (with all comma-separated synonyms) instead of "
                              "the default OpenAI/DINOv2 curated class names.")
@@ -487,7 +492,7 @@ def main():
     print(f"  Language encoder: {config.model.language_encoder}")
 
     model = ShareLock.load_from_checkpoint(
-        args.checkpoint, config=config, map_location=device
+        args.checkpoint, config=config, map_location=device, strict= False
     )
     model = model.to(device)
     model.eval()
@@ -555,80 +560,43 @@ def main():
         )
 
     else:
-        # ── HuggingFace imagenet-1k (gated dataset) ───────────────────────────
-        # Requires: HF_TOKEN env var with "gated repositories" permission enabled,
-        # and accepting the dataset terms at https://huggingface.co/datasets/imagenet-1k
-        hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-        if hf_token:
-            from huggingface_hub import login
-            login(token=hf_token, add_to_git_credential=False)
-        else:
-            print("WARNING: HF_TOKEN not set. Set it for gated dataset access.")
+        # ── Local Parquet files (downloaded via huggingface-cli) ──────────────
+        parquet_pattern = os.path.join(args.imagenet_data_dir, "data", "validation-*.parquet")
+        parquet_files = sorted(glob_module.glob(parquet_pattern))
+        if not parquet_files:
+            raise FileNotFoundError(
+                f"No validation Parquet files found at {parquet_pattern}\n"
+                f"Download first:\n"
+                f"  huggingface-cli download ILSVRC/imagenet-1k --repo-type dataset "
+                f"--include 'data/validation*' --local-dir {args.imagenet_data_dir}"
+            )
 
-        load_kwargs = dict(split="validation", cache_dir=args.dataset_cache_dir)
-        if hf_token:
-            load_kwargs["token"] = hf_token
-        if args.streaming:
-            load_kwargs["streaming"] = True
-            print("Loading ImageNet-1k in streaming mode (no local download) ...")
-        else:
-            print("Loading ImageNet-1k validation set from HuggingFace (downloading to cache) ...")
+        print(f"Loading ImageNet-1k validation from {len(parquet_files)} local Parquet files ...")
+        hf_dataset = load_dataset("parquet", data_files=parquet_files, split="train")
 
-        hf_dataset = load_dataset("ILSVRC/imagenet-1k", **load_kwargs)
+        class_names = hf_dataset.features["label"].names
+        print(f"  {len(class_names)} classes, {len(hf_dataset)} validation images")
 
-        if args.streaming:
-            # Streaming datasets don't have .features or len(); get class names separately
-            from datasets import load_dataset_builder
-            builder = load_dataset_builder("ILSVRC/imagenet-1k", token=hf_token)
-            class_names = builder.info.features["label"].names
-            print(f"  {len(class_names)} classes (streaming, image count not pre-known)")
-        else:
-            class_names = hf_dataset.features["label"].names
-            print(f"  {len(class_names)} classes, {len(hf_dataset)} validation images")
+        hf_dataset = hf_dataset.cast_column("image", HFImage(mode="RGB"))
 
         def hf_transform_fn(batch):
             batch["image"] = [image_transforms(img.convert("RGB")) for img in batch["image"]]
             return batch
 
-        if args.streaming:
-            hf_dataset = hf_dataset.map(hf_transform_fn, batched=True)
+        hf_dataset = hf_dataset.with_transform(hf_transform_fn)
 
-            def hf_collate_fn(samples):
-                images = torch.stack([torch.as_tensor(s["image"]) for s in samples])
-                labels = torch.tensor([s["label"] for s in samples])
-                return {"image": images, "label": labels}
+        def hf_collate_fn(samples):
+            images = torch.stack([torch.as_tensor(s["image"]) for s in samples])
+            labels = torch.tensor([s["label"] for s in samples])
+            return {"image": images, "label": labels}
 
-            from torch.utils.data import IterableDataset
-
-            class StreamingWrapper(IterableDataset):
-                def __init__(self, hf_iter):
-                    self.hf_iter = hf_iter
-                def __iter__(self):
-                    for item in self.hf_iter:
-                        yield item
-
-            dataloader = DataLoader(
-                StreamingWrapper(hf_dataset),
-                batch_size=args.batch_size,
-                num_workers=0,          # streaming requires num_workers=0
-                collate_fn=hf_collate_fn,
-            )
-        else:
-            hf_dataset = hf_dataset.cast_column("image", HFImage(mode="RGB"))
-            hf_dataset = hf_dataset.with_transform(hf_transform_fn)
-
-            def hf_collate_fn(samples):
-                images = torch.stack([torch.as_tensor(s["image"]) for s in samples])
-                labels = torch.tensor([s["label"] for s in samples])
-                return {"image": images, "label": labels}
-
-            dataloader = DataLoader(
-                hf_dataset,
-                batch_size=args.batch_size,
-                num_workers=args.num_workers,
-                collate_fn=hf_collate_fn,
-                pin_memory=True,
-            )
+        dataloader = DataLoader(
+            hf_dataset,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            collate_fn=hf_collate_fn,
+            pin_memory=True,
+        )
 
     # ── Class names ─────────────────────────────────────────────────────────
     # Default: OpenAI/DINOv2 curated names (single clean name per class).

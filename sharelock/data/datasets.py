@@ -28,7 +28,7 @@ def _tensor_cache_path(config, split):
     vis = config.model.vision_encoder.split("/")[-1]
     lang = config.model.language_encoder.split("/")[-1]
     filename = (
-        f"{config.data.dataset}__{vis}__{lang}__{caption_tag}"
+        f"{vis}__{lang}__{caption_tag}"
         f"__{split}_seed{config.seed}_val{config.data.val_split_num}.pt"
     ).replace("/", "-")
     cache_dir = os.path.join(config.data.precomputed_features_dir, "_tensor_cache")
@@ -60,10 +60,10 @@ class VisionLanguageFeatureDataset(Dataset):
         rng = random.Random(self.config.seed)
 
         # Loading precomputed image features
-        feature_dir = f"{self.config.data.precomputed_features_dir}/{self.config.data.dataset}/{self.config.model.vision_encoder.split('/')[-1]}"
+        feature_dir = f"{self.config.data.precomputed_features_dir}/{self.config.model.vision_encoder.split('/')[-1]}"
         image_features = FeatureUtils(base_dir=feature_dir, staging_dir=data_staging_dir, require_features_exist=True)
         if len(image_features.list_keys()) == 0:
-            raise ValueError(f"No vision features found in for dataset {self.config.data.dataset} and vision encoder {self.config.model.vision_encoder}")
+            raise ValueError(f"No vision features found for vision encoder {self.config.model.vision_encoder} in {feature_dir}")
         image_features.stage_data(features=["vision_features"])
 
         # Setup image ids and create splits
@@ -83,10 +83,10 @@ class VisionLanguageFeatureDataset(Dataset):
         # Loading precomputed language features for each caption file (randomly select caption at each iteration)
         self.language_tensors = []
         for caption_file in self.config.data.caption_files:
-            feature_dir = f"{self.config.data.precomputed_features_dir}/{self.config.data.dataset}/{self.config.model.language_encoder.split('/')[-1]}/{caption_file.replace('.json', '')}"
+            feature_dir = f"{self.config.data.precomputed_features_dir}/{self.config.model.language_encoder.split('/')[-1]}/{caption_file.replace('.json', '')}"
             language_features = FeatureUtils(base_dir=feature_dir, staging_dir=data_staging_dir, require_features_exist=True)
             if len(language_features.list_keys()) == 0:
-                raise ValueError(f"No language features found in for dataset {self.config.data.dataset} and language encoder {self.config.model.language_encoder} and caption file {caption_file}")
+                raise ValueError(f"No language features found for {self.config.model.language_encoder} / {caption_file} in {feature_dir}")
             language_features.stage_data()
             print(f"Pre-loading {split} language features [{caption_file}] into RAM...", flush=True)
             loaded = _load_features_parallel(language_features, feature_ids, ["language_features"])
@@ -144,17 +144,20 @@ class ClassificationFeatureDataset(Dataset):
         
         data_staging_dir = os.environ.get("TMPDIR", None)
         
-        feature_dir = f"{self.config.data.precomputed_features_dir}/{self.config.data.dataset}/{self.config.model.vision_encoder.split('/')[-1]}"
+        feature_dir = f"{self.config.data.precomputed_features_dir}/{self.config.model.vision_encoder.split('/')[-1]}"
         self.image_features = FeatureUtils(base_dir=feature_dir, staging_dir=data_staging_dir, require_features_exist=True)
         if len(self.image_features.list_keys()) == 0:
-            raise ValueError(f"No vision features found in for dataset {self.config.data.dataset} and vision encoder {self.config.model.vision_encoder}")
+            raise ValueError(f"No vision features found for {self.config.model.vision_encoder} in {feature_dir}")
         self.image_features.stage_data()
         self.feature_idxs = self.image_features.list_keys()
         
-        class_names_feature_dir = f"{self.config.data.precomputed_features_dir}/{self.config.data.dataset}/{self.config.model.language_encoder.split('/')[-1]}/{config.data.caption_files.replace('.json', '')}"
+        caption_files = config.data.caption_files
+        if isinstance(caption_files, list):
+            caption_files = caption_files[0]
+        class_names_feature_dir = f"{self.config.data.precomputed_features_dir}/{self.config.model.language_encoder.split('/')[-1]}/{caption_files.replace('.json', '')}"
         self.class_names_features = FeatureUtils(base_dir=class_names_feature_dir, staging_dir=data_staging_dir, require_features_exist=True)
         if len(self.class_names_features.list_keys()) == 0:
-            raise ValueError(f"No language features found in for dataset {self.config.data.dataset} and language encoder {self.config.model.language_encoder}")
+            raise ValueError(f"No language features found for {self.config.model.language_encoder} in {class_names_feature_dir}")
         self.class_names_features.stage_data()
         
     def __len__(self):
