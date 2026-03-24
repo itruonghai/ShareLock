@@ -12,7 +12,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PYTHON="$SCRIPT_DIR/.venv/bin/python"
+PYTHON="python"
 GPU=0
 CONFIG=""
 EVAL_ONLY=""

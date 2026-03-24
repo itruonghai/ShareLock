@@ -15,7 +15,7 @@ model:
     hidden_size: 4096
     num_layers: 0
     normalize: True
-  language_encoder: "meta-llama/Meta-Llama-3-8B"
+  language_encoder: "openai/clip-vit-large-patch14"
   language_projector:
     hidden_size: 4096
     num_layers: 4

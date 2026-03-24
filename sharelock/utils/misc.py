@@ -21,6 +21,7 @@ feature_dimensions_vision = {
 
 feature_dimensions_language = {
     "meta-llama/Meta-Llama-3-8B": 4096,
+    "openai/clip-vit-large-patch14": 768,
 }
 
 def loss(logits, target, logit_scale):
