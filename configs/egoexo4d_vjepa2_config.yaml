@@ -1,0 +1,46 @@
+seed: 42
+experiment_name: "egoexo4d_vjepa2.1_vitl"
+
+data:
+  caption_files: ["atomic_train"]   # matches --caption_name in precompute_video_features.py
+  num_workers: 16
+  val_split_num: 10000              # ~9% of ~54k samples held out for validation
+  precomputed_features_dir: "precomputed_features_video_adaptive"
+
+model:
+  embedding_space_dim: 768
+  vision_encoder: "vjepa2.1_vitig_384"  # 1536-dim; switch to vjepa2.1_vitl_384 for ViT-L
+  vision_projector:
+    hidden_size: 4096
+    num_layers: 0
+    normalize: True
+  language_encoder: "meta-llama/Meta-Llama-3-8B"
+  language_projector:
+    type: "mlp"                          # same as CC3M config (proven)
+    hidden_size: 4096
+    num_layers: 4
+    normalize: True
+    dropout: 0.1
+
+training:
+  max_steps: 10000
+  lr_warmup_steps: 300
+  learning_rate: 0.0005
+  lr_schedule: "cosine"
+  batch_size: 10000
+  accumulate_grad_batches: 2            # effective batch size = 4096
+  max_grad_norm: 1.0
+  weight_decay: 0.0001
+  early_stopping: True
+  early_stopping_patience: 30
+  early_stopping_min_delta: 0.001
+  num_gpus: 1  # single GPU
+  precision: "bf16-mixed"
+
+skip_test: true
+
+logging:
+  save_dir: "logs/"
+  save_checkpoint: True
+  log_every_n_steps: 1
+  val_check_interval: 50

@@ -1,0 +1,43 @@
+seed: 42
+experiment_name: "clip_text_scratch"
+
+data:
+  captions_file: "precomputed_features_scratch/captions.json"
+  num_workers: 8
+  val_split_num: 50000
+  precomputed_features_dir: "precomputed_features_scratch"
+
+model:
+  vision_encoder: "dinov2_vitl14"
+  vision_projector:
+    hidden_size: 1024      # unused when num_layers=0, required by Projection class
+    num_layers: 0          # Identity + L2-norm; embedding_space_dim = 1024 (DINOv2-L output)
+    normalize: true
+  language_encoder: "openai/clip-vit-large-patch14"  # 768-dim output
+  language_projector:
+    hidden_size: 768
+    num_layers: 2          # 768 → 768 → 1024
+    normalize: true
+    dropout: 0.1
+  train_language_encoder: true
+  language_from_scratch: true   # true = random init; false = fine-tune pretrained CLIP-Text
+
+training:
+  max_steps: 20000
+  lr_warmup_steps: 500
+  learning_rate: 0.0001
+  lr_schedule: "cosine"
+  batch_size: 2048              # per GPU; 3 GPUs → ~6144 global effective batch
+  accumulate_grad_batches: 1
+  max_grad_norm: 1.0
+  weight_decay: 0.0001
+  early_stopping: false
+  num_gpus: 3
+
+skip_test: true
+
+logging:
+  save_dir: "logs/"
+  save_checkpoint: true
+  log_every_n_steps: 10
+  val_check_interval: 500
