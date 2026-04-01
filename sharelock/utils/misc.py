@@ -17,11 +17,21 @@ feature_dimensions_vision = {
     "dinov2_vitb14_reg": 768,
     "dinov2_vitl14_reg": 1024,
     "dinov2_vitg14_reg": 1536,
+    # V-JEPA-2.1 (384px input, preferred)
+    "vjepa2.1_vitb_384":   768,
+    "vjepa2.1_vitl_384":  1024,
+    "vjepa2.1_vitg_384":  1408,
+    "vjepa2.1_vitig_384": 1664,
+    # V-JEPA-2 (224px input)
+    "vjepa2_vitl": 1024,
+    "vjepa2_vith": 1280,
+    "vjepa2_vitg": 1408,
 }
 
 feature_dimensions_language = {
     "meta-llama/Meta-Llama-3-8B": 4096,
     "openai/clip-vit-large-patch14": 768,
+    "egovlpv2": 768,  # RoBERTa-base CLS token (EgoVLPv2 pretrained on EgoCLIP/Ego4D)
 }
 
 def loss(logits, target, logit_scale):
