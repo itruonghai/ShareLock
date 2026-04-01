@@ -144,6 +144,16 @@ def extract_language(rank, num_gpus, captions, args):
     print(f"[Lang GPU {rank}] Done.")
 
 
+def save_captions_to_file(captions, output_dir):
+    """Save {image_id: caption} dict to {output_dir}/captions.json."""
+    import json
+    os.makedirs(output_dir, exist_ok=True)
+    captions_path = os.path.join(output_dir, "captions.json")
+    with open(captions_path, "w") as f:
+        json.dump(captions, f)
+    print(f"Saved {len(captions)} captions to {captions_path}")
+
+
 def worker(rank, args):
     """Per-GPU worker: load dataset once, extract vision then language features."""
     num_gpus = args.num_gpus
@@ -153,7 +163,7 @@ def worker(rank, args):
         dataset = load_dataset(args.dataset_dir, split="train")
 
         captions = {}
-        if args.extract == "both":
+        if args.extract == "both" or args.save_captions:
             print(f"[GPU {rank}] Collecting captions...")
             all_captions = dataset["caption"]
             captions = {str(i): cap for i, cap in enumerate(all_captions)}
@@ -162,6 +172,10 @@ def worker(rank, args):
         del dataset
         gc.collect()
         torch.cuda.empty_cache()
+
+        # Save captions to JSON (only from rank 0 to avoid duplicate writes)
+        if args.save_captions and rank == 0:
+            save_captions_to_file(captions, args.output_dir)
 
         if args.extract == "both":
             extract_language(rank, num_gpus, captions, args)
@@ -207,6 +221,8 @@ def parse_args():
                         help="DataLoader workers for vision extraction")
     parser.add_argument("--caption_name", type=str, default="captions",
                         help="Subdirectory name for language features (matches caption_files config)")
+    parser.add_argument("--save_captions", action="store_true",
+                        help="Save raw captions to {output_dir}/captions.json (for online text-encoder training)")
     return parser.parse_args()
 
 

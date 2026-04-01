@@ -31,8 +31,8 @@ class ETACallback(pl.Callback):
         eta_min = remaining / (step / elapsed) / 60
         pl_module.log("eta_min", eta_min, prog_bar=True, on_step=True, on_epoch=False)
 
-from sharelock.data.data import DataModule
-from sharelock.models.model import ShareLock
+from sharelock.data.data import DataModule, TextEncoderDataModule
+from sharelock.models.model import ShareLock, ShareLockWithTextEncoder
 
 if __name__ == "__main__":
     torch.set_float32_matmul_precision("high")
@@ -53,16 +53,20 @@ if __name__ == "__main__":
     # Seeding
     pl.seed_everything(config.seed, workers=True)
     
+    # Select model class and data module based on config
+    train_text_encoder = config.model.get("train_language_encoder", False)
+    model_cls = ShareLockWithTextEncoder if train_text_encoder else ShareLock
+
     # Initialize data module
     print("Loading data")
-    data_module = DataModule(config)
-    
+    data_module = TextEncoderDataModule(config) if train_text_encoder else DataModule(config)
+
     # Initialize model
     print("Loading model")
     if args.checkpoint is not None:
-        model = ShareLock.load_from_checkpoint(args.checkpoint, config=config, weights_only=False)
+        model = model_cls.load_from_checkpoint(args.checkpoint, config=config, weights_only=False)
     else:
-        model = ShareLock(config)
+        model = model_cls(config)
     
     # Initialize callbacks
     callbacks = [ETACallback()]
@@ -117,7 +121,7 @@ if __name__ == "__main__":
 
         # PyTorch >= 2.6 defaults weights_only=True which blocks omegaconf types stored
         # in Lightning checkpoints. This checkpoint is locally generated and trusted.
-        model = ShareLock.load_from_checkpoint(
+        model = model_cls.load_from_checkpoint(
             checkpointing.best_model_path, config=config, weights_only=False
         )
     

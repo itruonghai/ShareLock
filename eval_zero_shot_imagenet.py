@@ -46,7 +46,7 @@ def _patched_torch_load(*args, **kwargs):
 torch.load = _patched_torch_load
 
 from torchvision import transforms as tv_transforms
-from sharelock.models.model import ShareLock
+from sharelock.models.model import ShareLock, ShareLockWithTextEncoder
 
 
 # 80-template ensemble from the CLIP paper / CLIP-Benchmark
@@ -491,8 +491,10 @@ def main():
     print(f"  Vision encoder : {config.model.vision_encoder}")
     print(f"  Language encoder: {config.model.language_encoder}")
 
-    model = ShareLock.load_from_checkpoint(
-        args.checkpoint, config=config, map_location=device, strict= False
+    train_lang_encoder = config.model.get("train_language_encoder", False)
+    model_cls = ShareLockWithTextEncoder if train_lang_encoder else ShareLock
+    model = model_cls.load_from_checkpoint(
+        args.checkpoint, config=config, map_location=device, strict=False
     )
     model = model.to(device)
     model.eval()
@@ -627,7 +629,8 @@ def main():
 
     # Unload language model to free GPU memory before image evaluation
     if model.language_encoder is not None:
-        model.language_encoder.unload_model()
+        if hasattr(model.language_encoder, "unload_model"):
+            model.language_encoder.unload_model()
         torch.cuda.empty_cache()
 
     # ── Run evaluation ───────────────────────────────────────────────────────

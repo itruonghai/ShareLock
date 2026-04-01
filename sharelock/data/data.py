@@ -2,7 +2,7 @@ import torch
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader
 
-from sharelock.data.datasets import VisionLanguageFeatureDataset, InMemoryBatchDataset, ClassificationFeatureDataset
+from sharelock.data.datasets import VisionLanguageFeatureDataset, InMemoryBatchDataset, ClassificationFeatureDataset, VisionCaptionDataset
 
 class DataModule(pl.LightningDataModule):
     def __init__(self, config):
@@ -35,3 +35,41 @@ class DataModule(pl.LightningDataModule):
     
     def test_dataloader(self):
         return DataLoader(self.test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, pin_memory=True, prefetch_factor=12)
+
+
+class TextEncoderDataModule(pl.LightningDataModule):
+    """DataModule for online text-encoder training mode.
+
+    Loads precomputed vision features + raw caption strings.
+    Uses a standard DataLoader so PL's DistributedSampler shards across GPUs in DDP.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config.copy()
+        self.batch_size = config.training.batch_size
+        self.num_workers = config.data.num_workers
+
+    def setup(self, stage=None):
+        if stage == "fit" or stage is None:
+            self.train_dataset = VisionCaptionDataset(self.config, split="train")
+            self.val_dataset = VisionCaptionDataset(self.config, split="val")
+
+    def train_dataloader(self):
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
+
+    def val_dataloader(self):
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=True,
+        )
