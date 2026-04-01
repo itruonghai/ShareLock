@@ -145,3 +145,163 @@ Configs use OmegaConf YAML format. The best-performing config is `configs/cc3m_l
 - Optimizer: Adam with cosine LR schedule and warmup
 - Data: 555k CC3M training samples, batches preloaded into memory
 - Eval: Zero-shot ImageNet classification using 80 CLIP prompt templates
+
+---
+
+## EgoExo4D Video-Text Retrieval
+
+Extension for egocentric video-text retrieval on the EgoExo4D dataset (atomic action descriptions).
+
+### Prerequisites
+
+```
+EgoExo/
+  takes.json                              # take metadata (fps, activity, etc.)
+  annotations/atomic_descriptions_val.json
+  val_takes.txt                           # newline-separated take_uids for val split
+  val_videos/takes/<take_uid>/...         # ego-view MP4 files
+```
+
+### Step 1 — Precompute Video Features
+
+```bash
+# Single GPU, val split (adaptive 4-frame sampling around annotation timestamp)
+python precompute_video_features.py \
+    --annotation_json EgoExo/annotations/atomic_descriptions_val.json \
+    --takes_json EgoExo/takes.json \
+    --video_root EgoExo/val_videos/takes \
+    --split_file EgoExo/val_takes.txt \
+    --output_dir precomputed_features_video_adaptive_val \
+    --vision_model vjepa2_vitl          # or egovlpv2
+
+# Multi-GPU (shard across 4 GPUs)
+python precompute_video_features.py ... --num_gpus 4
+
+# Precompute language features (text encoder side)
+python precompute_video_features.py \
+    --annotation_json EgoExo/annotations/atomic_descriptions_val.json \
+    --takes_json EgoExo/takes.json \
+    --video_root EgoExo/val_videos/takes \
+    --output_dir precomputed_features_language_val \
+    --extract language \
+    --language_model egovlpv2           # or meta-llama/Meta-Llama-3-8B
+```
+
+### Step 2 — Evaluate Retrieval
+
+```bash
+python eval_egoexo4d_retrieval.py \
+    --checkpoint logs/<exp>/version_X/checkpoints/best_model.ckpt \
+    --config configs/egoexo4d_vjepa2_config.yaml \
+    --precomputed_features_dir precomputed_features_video_adaptive_val \
+    --takes_json EgoExo/takes.json
+```
+
+**Key flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--max_eval_pairs` | 1000 | Subsample N pairs for faster eval (use 0 for full set) |
+| `--per_category` | off | Print R@K / MCQ breakdown per activity category |
+| `--save_plot` | off | Save 2-panel rank+score PNG to `<checkpoint>_analysis.png` |
+| `--mcq_5way` | off | Run 5-way MCQ retrieval (1 GT + 4 same-take hard negatives) |
+| `--annotation_json` | — | Required for `--mcq_5way`; path to atomic_descriptions JSON |
+| `--video_root` | — | Required for `--mcq_5way`; path to raw video directory |
+| `--split_file` | — | Optional val split filter for MCQ caption map |
+| `--mcq_seed` | 42 | RNG seed for MCQ distractor sampling |
+
+**Full example with MCQ and per-category breakdown:**
+
+```bash
+python eval_egoexo4d_retrieval.py \
+    --checkpoint logs/egoexo4d_vjepa2.1_vitl/version_9/checkpoints/best_model.ckpt \
+    --config configs/egoexo4d_vjepa2_config.yaml \
+    --precomputed_features_dir precomputed_features_video_adaptive_val \
+    --takes_json EgoExo/takes.json \
+    --annotation_json EgoExo/annotations/atomic_descriptions_val.json \
+    --video_root EgoExo/val_videos/takes \
+    --split_file EgoExo/val_takes.txt \
+    --max_eval_pairs 0 \
+    --per_category \
+    --save_plot \
+    --mcq_5way
+```
+
+**Metrics reported:**
+
+| Metric | Random baseline | Direction |
+|--------|----------------|-----------|
+| R@1, R@5, R@10 | 0.1% (N=1000) | V→T and T→V |
+| MedR | N/2 ≈ 500 | V→T and T→V |
+| MeanR | N/2 ≈ 500 | V→T and T→V |
+| ScoreGap | 0.0 | overall |
+| GT-pct | 50% | overall |
+| MCQ 5-way accuracy | 20% | V→T |
+
+### Step 3 — Visualize Retrieval Results
+
+```bash
+python visualize_retrieval.py \
+    --checkpoint logs/<exp>/version_X/checkpoints/best_model.ckpt \
+    --config configs/egoexo4d_vjepa2_config.yaml \
+    --precomputed_features_dir precomputed_features_video_adaptive_val \
+    --takes_json EgoExo/takes.json \
+    --video_root EgoExo/val_videos/takes \
+    --output retrieval_viz.mp4
+```
+
+**Direction (`--direction`):**
+
+| Value | Description |
+|-------|-------------|
+| `v2t` | Video query → retrieve top-K captions (default) |
+| `t2v` | Text query → retrieve top-K video clips (4 frame thumbnails each) |
+| `both` | Side-by-side V→T and T→V for each query |
+| `mcq` | 5-way MCQ: video + 5 labeled options A–E with cosine scores |
+
+**Mode (`--mode`) — which queries to sample:**
+
+| Value | Description |
+|-------|-------------|
+| `random` | Random queries from the pool (default) |
+| `correct` | Queries where R@1 is correct |
+| `incorrect` | Queries where R@1 is wrong |
+| `mixed` | Mix of correct and incorrect (biased toward R@1 hits) |
+| `per_category` | Sample `--queries_per_category` from each activity category |
+
+**Other flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--num_queries` | 20 | Number of query slides to render |
+| `--top_k` | 5 | Number of retrieved results shown per slide |
+| `--queries_per_category` | 3 | Used with `--mode per_category` |
+| `--mcq_seed` | 42 | RNG seed for MCQ option shuffling |
+| `--annotation_json` | — | Required for `--direction mcq` |
+| `--split_file` | — | Optional val split filter |
+
+**MCQ visualization example:**
+
+```bash
+python visualize_retrieval.py \
+    --checkpoint logs/egoexo4d_vjepa2.1_vitl/version_9/checkpoints/best_model.ckpt \
+    --config configs/egoexo4d_vjepa2_config.yaml \
+    --precomputed_features_dir precomputed_features_video_adaptive_val \
+    --takes_json EgoExo/takes.json \
+    --video_root EgoExo/val_videos/takes \
+    --annotation_json EgoExo/annotations/atomic_descriptions_val.json \
+    --split_file EgoExo/val_takes.txt \
+    --direction mcq \
+    --mode random \
+    --num_queries 30 \
+    --output retrieval_mcq.mp4
+```
+
+Each MCQ slide shows: top 38% = video frames, bottom 62% = 5 option boxes (green=GT, red=wrong model pick) with cosine similarity score badge and normalized bar chart per option.
+
+### Notes on Results
+
+- **R@1 is low (~4–5%)** because EgoExo4D atomic actions are semantically near-duplicate ("C picks up X", "C places Y"). The model still works: GT-pct ≈ 87% means the correct pair beats 87% of all distractors.
+- **MCQ accuracy** (~37% at N=17k full set) is significantly above random (20%), confirming real discriminative ability. MCQ mitigates semantic collision by selecting distractors with a different primary action verb.
+- **Negative cosine scores** are expected for non-GT pairs. InfoNCE loss pushes non-matching pairs apart on the unit hypersphere; background distribution centers near 0 with many negative values.
+- See `analysis_egoexo4d.md` for full metric explanations and LLaMA-3-8B vs EgoVLPv2 comparison.
