@@ -308,20 +308,31 @@ def extract_video_ego4d(rank: int, num_gpus: int, samples: list, args) -> None:
     frames_buf: list = []
     keys_buf:   list = []
 
+    # ── Timing accumulators ───────────────────────────────────────────────────
+    import time as _time
+    _t_io_total   = 0.0   # wall time blocked waiting for IO futures
+    _t_gpu_total  = 0.0   # wall time inside flush() (GPU encode + save)
+    _n_flushes    = 0
+    _n_vids_done  = 0
+    _PROFILE_EVERY = 5    # print breakdown every N completed videos
+
     @torch.no_grad()
     def flush():
+        nonlocal _t_gpu_total, _n_flushes
         if not frames_buf:
             return
+        t0 = _time.perf_counter()
         batch    = torch.stack(frames_buf).to(device)   # [B, T, C, H, W]
         features = encoder(batch)                        # [B, embed_dim]
+        torch.cuda.synchronize(device)                  # wait for GPU to finish
         for key, feat in zip(keys_buf, features):
             feature_utils.save_feature(key, vision_features=feat.detach().cpu())
+        _t_gpu_total += _time.perf_counter() - t0
+        _n_flushes   += 1
         frames_buf.clear()
         keys_buf.clear()
 
     # ── IO threads decode; main thread encodes on GPU ────────────────────────
-    # Clip-level bar: ticks every clip so progress is visible even while the
-    # first few large source videos are still being decoded by workers.
     clip_bar = tqdm.tqdm(
         total=n_clips, desc=f"[GPU {rank}] clips", unit="clip",
         dynamic_ncols=True,
@@ -331,13 +342,10 @@ def extract_video_ego4d(rank: int, num_gpus: int, samples: list, args) -> None:
         dynamic_ncols=True, position=1, leave=True,
     )
 
-    # Submit in sliding-window batches of num_workers to cap live decoded frames.
-    # Submitting all 8k+ videos at once would hold all decoded frame tensors in
-    # memory simultaneously (num_workers active + all completed-but-unread futures).
     SUBMIT_WINDOW = args.num_workers * 2
 
     with ThreadPoolExecutor(max_workers=args.num_workers) as pool:
-        pending: dict = {}   # future -> (vpath, n_clips)
+        pending: dict = {}   # future -> (vpath, n_clips, t_submit)
         path_iter = iter(assigned_paths)
 
         def _fill_window():
@@ -351,9 +359,17 @@ def extract_video_ego4d(rank: int, num_gpus: int, samples: list, args) -> None:
 
         _fill_window()
         while pending:
+            # Time how long as_completed blocks waiting for the next future.
+            # If GPU is the bottleneck, IO workers finish before GPU consumes
+            # the previous batch → as_completed returns instantly (≈0 ms wait).
+            # If IO is the bottleneck, as_completed blocks until a worker finishes.
+            t_wait_start = _time.perf_counter()
             for future in as_completed(pending):
+                _t_io_total += _time.perf_counter() - t_wait_start  # blocked time
+
                 vpath, n_in_video = pending.pop(future)
                 decoded = future.result()
+
                 for frames, key in decoded:
                     if frames is None:
                         clip_bar.update(1)
@@ -363,8 +379,24 @@ def extract_video_ego4d(rank: int, num_gpus: int, samples: list, args) -> None:
                     clip_bar.update(1)
                     if len(frames_buf) >= args.batch_size:
                         flush()
+
+                _n_vids_done += 1
                 vid_bar.update(1)
                 vid_bar.set_postfix({"last": os.path.basename(vpath)})
+
+                # ── Periodic bottleneck report ────────────────────────────
+                if _n_vids_done % _PROFILE_EVERY == 0 and _n_flushes > 0:
+                    avg_gpu_ms = _t_gpu_total / _n_flushes * 1000
+                    avg_io_ms  = _t_io_total  / _n_vids_done * 1000
+                    ms_per_clip_gpu = avg_gpu_ms / args.batch_size
+                    tqdm.tqdm.write(
+                        f"[Bottleneck @ {_n_vids_done} vids | {_n_flushes} flushes] "
+                        f"avg GPU/flush={avg_gpu_ms:.0f}ms "
+                        f"({ms_per_clip_gpu:.0f}ms/clip) | "
+                        f"avg IO-wait={avg_io_ms:.0f}ms/vid  "
+                        f"→ {'** IO-BOUND **' if avg_io_ms > avg_gpu_ms else '** GPU-BOUND **'}"
+                    )
+
                 _fill_window()
                 break   # re-enter as_completed with updated pending
 
