@@ -1,14 +1,20 @@
 """
-Precompute V-JEPA-2 / V-JEPA-2.1 video features and LLaMA-3-8B language features
-for EgoExo4D Atomic Action Descriptions.
+Precompute V-JEPA-2 / V-JEPA-2.1 video features and LLaMA-3-8B language features.
 
-Features are stored via featureutils (same format as precompute_features.py),
-keyed by  "{take_uid}__{frame_idx}"  where frame_idx = round(anchor_t * fps).
-This gives frame-accurate, collision-free keys that are stable across runs.
+Supports two datasets via --dataset:
+  egoexo4d  (default) — EgoExo4D Atomic Action Descriptions
+  ego4d               — Ego4D egovid-5m (CSV with video_id + llava_cap)
 
-Usage:
-  # Step 1 — video features (multi-GPU)
+Keys:
+  EgoExo4D: "{take_uid}__{frame_idx}"  (frame-accurate, FPS-based)
+  Ego4D:    "{video_id}"               (one clip per video_id)
+
+──────────────────────────────────────────────────────────────────────────────
+EgoExo4D usage:
+
+  # Video features (multi-GPU)
   python precompute_video_features.py \\
+      --dataset egoexo4d \\
       --video_root EgoExo/train_videos/takes \\
       --annotation_json EgoExo/annotations/atomic_descriptions_train.json \\
       --takes_json EgoExo/takes.json \\
@@ -17,10 +23,9 @@ Usage:
       --output_dir precomputed_features_video \\
       --extract video --num_gpus 4 --batch_size 32 --num_workers 8
 
-  # Step 2 — language features (multi-GPU)
-  # NOTE: --video_root is required — keys are frame-accurate (FPS read from video)
-  #       and load_egoexo4d_annotations filters by video_path.exists()
+  # Language features (multi-GPU)
   python precompute_video_features.py \\
+      --dataset egoexo4d \\
       --video_root EgoExo/train_videos/takes \\
       --annotation_json EgoExo/annotations/atomic_descriptions_train.json \\
       --takes_json EgoExo/takes.json \\
@@ -30,14 +35,35 @@ Usage:
       --output_dir precomputed_features_video \\
       --extract language --num_gpus 4
 
-  # Dry-run (single GPU, small batch) to verify paths
+──────────────────────────────────────────────────────────────────────────────
+Ego4D usage:
+
+  # Video features
   python precompute_video_features.py \\
-      --video_root EgoExo/train_videos/takes \\
-      --annotation_json EgoExo/annotations/atomic_descriptions_train.json \\
-      --takes_json EgoExo/takes.json \\
-      --split_file EgoExo/train_takes.txt \\
+      --dataset ego4d \\
+      --ego4d_root /path/to/ego4d \\
+      --csv_file /path/to/ego4d/egovid-text.csv \\
       --variant vjepa2.1_vitl_384 \\
-      --output_dir precomputed_features_video \\
+      --output_dir precomputed_features_ego4d \\
+      --extract video --num_gpus 4 --batch_size 32 --num_workers 8
+
+  # Language features
+  python precompute_video_features.py \\
+      --dataset ego4d \\
+      --ego4d_root /path/to/ego4d \\
+      --csv_file /path/to/ego4d/egovid-text.csv \\
+      --language_model meta-llama/Meta-Llama-3-8B \\
+      --caption_name egovid_train \\
+      --output_dir precomputed_features_ego4d \\
+      --extract language --num_gpus 4
+
+  # Dry-run (single GPU, small batch)
+  python precompute_video_features.py \\
+      --dataset ego4d \\
+      --ego4d_root /path/to/ego4d \\
+      --csv_file /path/to/ego4d/egovid-text.csv \\
+      --variant vjepa2.1_vitl_384 \\
+      --output_dir precomputed_features_ego4d \\
       --extract video --num_gpus 1 --batch_size 4 --num_workers 4 --max_samples 8
 """
 
@@ -54,8 +80,13 @@ import tqdm
 from featureutils.core import FeatureUtils
 from sharelock.models.video_encoder import VideoEncoder
 from sharelock.models.language_encoder import LanguageEncoder, EgoVLPv2TextEncoder
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import defaultdict
+
 from dataloader_video import (
     load_egoexo4d_annotations,
+    load_ego4d_annotations,
+    decode_clips_from_video,
     sample_frames_centered,
     sample_frames_adaptive,
     SamplingConfig,
@@ -97,27 +128,47 @@ def make_key(take_uid: str, anchor_t: float, video_path: str) -> str:
 # ---------------------------------------------------------------------------
 
 class VideoClipDataset(torch.utils.data.Dataset):
-    """Wraps a list of annotation samples for async frame decoding via DataLoader."""
+    """Wraps a list of annotation samples for async frame decoding via DataLoader.
+
+    Works for both EgoExo4D (frame-accurate make_key) and Ego4D (video_id key).
+    Samples that already carry a "key" field (Ego4D) skip make_key computation.
+    Samples that carry a "clip_duration" field (Ego4D full-video sampling) use
+    that value instead of the global cfg.clip_duration.
+    """
 
     def __init__(self, samples: list, sampling_cfg: SamplingConfig, existing_keys: set):
+        self.cfg = sampling_cfg
         # Pre-filter already-extracted keys so workers never touch them
         self.items = [
             s for s in samples
-            if make_key(s["take_uid"], s["timestamp"], s["video_path"]) not in existing_keys
+            if self._sample_key(s) not in existing_keys
         ]
-        self.cfg = sampling_cfg
+
+    def _sample_key(self, s: dict) -> str:
+        """Return the feature-store key for a sample."""
+        if "key" in s:
+            return s["key"]
+        return make_key(s["take_uid"], s["timestamp"], s["video_path"])
 
     def __len__(self):
         return len(self.items)
 
     def __getitem__(self, idx):
-        s = self.items[idx]
-        key = make_key(s["take_uid"], s["timestamp"], s["video_path"])
-        if self.cfg.mode == "adaptive":
+        s   = self.items[idx]
+        key = self._sample_key(s)
+
+        # Per-sample clip duration override (Ego4D: full-video sampling)
+        if "clip_duration" in s:
+            from dataclasses import replace
+            cfg = replace(self.cfg, clip_duration=s["clip_duration"])
+        else:
+            cfg = self.cfg
+
+        if cfg.mode == "adaptive":
             frames = sample_frames_adaptive(
                 video_path=s["video_path"],
                 timestamp=s["timestamp"],
-                cfg=self.cfg,
+                cfg=cfg,
                 video_duration=s["video_duration"],
                 prev_timestamp=s.get("prev_timestamp"),
                 next_timestamp=s.get("next_timestamp"),
@@ -126,7 +177,7 @@ class VideoClipDataset(torch.utils.data.Dataset):
             frames = sample_frames_centered(
                 video_path=s["video_path"],
                 timestamp=s["timestamp"],
-                cfg=self.cfg,
+                cfg=cfg,
                 video_duration=s["video_duration"],
             )
         if frames is None:
@@ -195,6 +246,105 @@ def extract_video(rank: int, num_gpus: int, samples: list, args) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Ego4D-optimized video extraction: group by source video, one open per file
+# ---------------------------------------------------------------------------
+
+def extract_video_ego4d(rank: int, num_gpus: int, samples: list, args) -> None:
+    """
+    Ego4D video feature extraction optimised for many clips per source video.
+
+    Strategy:
+      1. Group clips by source video path (one av.open per source file).
+      2. Shard by *source video* across GPUs so each GPU owns disjoint files.
+      3. Decode with a ThreadPoolExecutor (IO-bound): num_workers threads each
+         open one source video, seek forward through all its clips, and return
+         decoded frame tensors.
+      4. The main thread collects decoded frames into batches and runs the GPU
+         encoder, keeping the GPU saturated.
+
+    This reduces av.open calls from O(clips) to O(source_videos).
+    For Ego4D (egovid-5m): ~8,451 opens instead of ~4,873,088.
+    """
+    device     = torch.device(f"cuda:{rank}")
+    output_dir = f"{args.output_dir}/{args.variant}"
+
+    feature_utils = FeatureUtils(
+        base_dir=output_dir, staging_dir=args.cache_dir, feature_num=1
+    )
+    existing_keys = set(feature_utils.list_keys())
+    print(f"[Video GPU {rank}] Existing features: {len(existing_keys)}")
+
+    # ── Group clips by source video; skip already-extracted ──────────────────
+    groups: dict = defaultdict(list)
+    for s in samples:
+        if s["key"] not in existing_keys:
+            groups[s["video_path"]].append(s)
+
+    # Shard by source-video index for balanced multi-GPU distribution
+    all_paths      = sorted(groups.keys())
+    assigned_paths = [p for i, p in enumerate(all_paths) if i % num_gpus == rank]
+    n_clips        = sum(len(groups[p]) for p in assigned_paths)
+    print(f"[Video GPU {rank}] {len(assigned_paths)} source videos, "
+          f"{n_clips} clips to encode")
+
+    # Optional clip-count cap for dry-runs
+    if args.max_samples is not None:
+        capped, count = [], 0
+        for p in assigned_paths:
+            capped.append(p)
+            count += len(groups[p])
+            if count >= args.max_samples:
+                break
+        assigned_paths = capped
+
+    sampling_cfg = SamplingConfig(
+        num_frames=args.num_frames,
+        clip_duration=args.clip_duration,   # overridden per-clip in sample dict
+        frame_size=VideoEncoder.VARIANTS[args.variant][2],
+        mode="centered",
+    )
+    encoder = VideoEncoder(variant=args.variant).to(device)
+
+    frames_buf: list = []
+    keys_buf:   list = []
+
+    @torch.no_grad()
+    def flush():
+        if not frames_buf:
+            return
+        batch    = torch.stack(frames_buf).to(device)   # [B, T, C, H, W]
+        features = encoder(batch)                        # [B, embed_dim]
+        for key, feat in zip(keys_buf, features):
+            feature_utils.save_feature(key, vision_features=feat.detach().cpu())
+        frames_buf.clear()
+        keys_buf.clear()
+
+    # ── IO threads decode; main thread encodes on GPU ────────────────────────
+    with ThreadPoolExecutor(max_workers=args.num_workers) as pool:
+        futures = {
+            pool.submit(decode_clips_from_video, vpath, groups[vpath], sampling_cfg): vpath
+            for vpath in assigned_paths
+        }
+        for future in tqdm.tqdm(
+            as_completed(futures), total=len(futures),
+            desc=f"[Video GPU {rank}] source videos",
+        ):
+            for frames, key in future.result():
+                if frames is None:
+                    continue
+                frames_buf.append(frames)
+                keys_buf.append(key)
+                if len(frames_buf) >= args.batch_size:
+                    flush()
+
+    flush()   # remaining partial batch
+    feature_utils.save()
+    del encoder
+    torch.cuda.empty_cache()
+    print(f"[Video GPU {rank}] Done.")
+
+
+# ---------------------------------------------------------------------------
 # Language feature extraction (mirrors precompute_features.py)
 # ---------------------------------------------------------------------------
 
@@ -252,31 +402,54 @@ def extract_language(rank: int, num_gpus: int, captions: dict, args) -> None:
 # Worker (one per GPU)
 # ---------------------------------------------------------------------------
 
+def _load_samples(args) -> list:
+    """Load annotation samples for the selected dataset."""
+    if args.dataset == "ego4d":
+        import pathlib
+        video_root = str(pathlib.Path(args.ego4d_root) / "v2" / "video_540ss")
+        return load_ego4d_annotations(
+            csv_file=args.csv_file,
+            video_root=video_root,
+            split_file=args.split_file,
+        )
+    else:  # egoexo4d
+        filter_cfg = FilterConfig(
+            keep_subject_C_only=True,
+            drop_unsure=True,
+            require_ego_visible=True,
+            min_timestamp=2.0,
+        )
+        sampling_cfg = SamplingConfig(
+            num_frames=args.num_frames,
+            clip_duration=args.clip_duration,
+            mode=args.sampling_mode,
+        )
+        return load_egoexo4d_annotations(
+            annotation_json=args.annotation_json,
+            takes_json=args.takes_json,
+            video_root=args.video_root if args.video_root else "",
+            filter_cfg=filter_cfg,
+            sampling_cfg=sampling_cfg,
+            split_file=args.split_file,
+        )
+
+
+def _sample_key(sample: dict) -> str:
+    """Return the feature-store key for a sample (dataset-agnostic)."""
+    if "key" in sample:
+        return sample["key"]
+    return make_key(sample["take_uid"], sample["timestamp"], sample["video_path"])
+
+
 def worker(rank: int, args) -> None:
     """Load annotations once, then extract video and/or language features."""
-    filter_cfg = FilterConfig(
-        keep_subject_C_only=True,
-        drop_unsure=True,
-        require_ego_visible=True,
-        min_timestamp=2.0,
-    )
-    sampling_cfg = SamplingConfig(
-        num_frames=args.num_frames,
-        clip_duration=args.clip_duration,
-        mode=args.sampling_mode,
-    )
-
-    samples = load_egoexo4d_annotations(
-        annotation_json=args.annotation_json,
-        takes_json=args.takes_json,
-        video_root=args.video_root if args.video_root else "",
-        filter_cfg=filter_cfg,
-        sampling_cfg=sampling_cfg,
-        split_file=args.split_file,
-    )
+    samples = _load_samples(args)
 
     if args.extract in ("video", "both"):
-        extract_video(rank, args.num_gpus, samples, args)
+        if args.dataset == "ego4d":
+            extract_video_ego4d(rank, args.num_gpus, samples, args)
+        else:
+            extract_video(rank, args.num_gpus, samples, args)
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -284,9 +457,7 @@ def worker(rank: int, args) -> None:
         # Build {key: text} dict — keys must match video feature keys exactly
         captions: dict = {}
         for sample in samples:
-            key = make_key(
-                sample["take_uid"], sample["timestamp"], sample["video_path"]
-            )
+            key = _sample_key(sample)
             if key not in captions:
                 captions[key] = sample["text"]
         print(f"[Lang GPU {rank}] {len(captions)} unique captions")
@@ -299,17 +470,33 @@ def worker(rank: int, args) -> None:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Precompute V-JEPA-2 video + LLaMA language features for EgoExo4D"
+        description="Precompute V-JEPA-2 video + language features (EgoExo4D or Ego4D)"
     )
-    # Data paths
-    parser.add_argument("--annotation_json", type=str, required=True,
-                        help="atomic_descriptions_{train|val}.json")
-    parser.add_argument("--takes_json", type=str, required=True,
-                        help="takes.json")
+
+    # ── Dataset selector ─────────────────────────────────────────────────────
+    parser.add_argument("--dataset", type=str, default="egoexo4d",
+                        choices=["egoexo4d", "ego4d"],
+                        help="Dataset to process: egoexo4d (default) or ego4d")
+
+    # ── EgoExo4D paths ────────────────────────────────────────────────────────
+    parser.add_argument("--annotation_json", type=str, default=None,
+                        help="[EgoExo4D] atomic_descriptions_{train|val}.json")
+    parser.add_argument("--takes_json", type=str, default=None,
+                        help="[EgoExo4D] takes.json")
     parser.add_argument("--video_root", type=str, default=None,
-                        help="Root of video files, e.g. EgoExo/train_videos/takes")
+                        help="[EgoExo4D] Root of video files, e.g. EgoExo/train_videos/takes")
+
+    # ── Ego4D paths ───────────────────────────────────────────────────────────
+    parser.add_argument("--ego4d_root", type=str, default=None,
+                        help="[Ego4D] Path to ego4d root directory "
+                             "(videos are at ego4d_root/v2/video_540ss/)")
+    parser.add_argument("--csv_file", type=str, default=None,
+                        help="[Ego4D] Path to annotation CSV "
+                             "(e.g. ego4d/egovid-text.csv or egovid-val.csv)")
+
+    # ── Shared split filter ───────────────────────────────────────────────────
     parser.add_argument("--split_file", type=str, default=None,
-                        help="train_takes.txt or val_takes.txt")
+                        help="Optional file of allowed take/video IDs (one per line)")
 
     # Model / variant
     parser.add_argument("--variant", type=str, default="vjepa2.1_vitl_384",
@@ -353,15 +540,30 @@ def parse_args():
                         help="Cap samples per GPU (useful for dry-runs)")
     parser.add_argument("--sampling_mode", type=str, default="centered",
                         choices=["centered", "adaptive"],
-                        help="Frame sampling: centered (fixed 4s window) or adaptive (Voronoi, no inter-clip overlap)")
+                        help="[EgoExo4D] Frame sampling: centered (fixed window) or "
+                             "adaptive (Voronoi). Ego4D always samples the full clip.")
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # ── Validate required args per dataset ───────────────────────────────────
+    if args.dataset == "egoexo4d":
+        if args.annotation_json is None:
+            parser.error("--annotation_json is required for --dataset egoexo4d")
+        if args.takes_json is None:
+            parser.error("--takes_json is required for --dataset egoexo4d")
+    elif args.dataset == "ego4d":
+        if args.ego4d_root is None:
+            parser.error("--ego4d_root is required for --dataset ego4d")
+        if args.csv_file is None:
+            parser.error("--csv_file is required for --dataset ego4d")
+
+    return args
 
 
 if __name__ == "__main__":
     args = parse_args()
 
-    print(f"Extract: {args.extract} | GPUs: {args.num_gpus}")
+    print(f"Dataset: {args.dataset} | Extract: {args.extract} | GPUs: {args.num_gpus}")
     if args.extract in ("video", "both"):
         print(f"  Video variant: {args.variant} (batch_size={args.batch_size})")
     if args.extract in ("language", "both"):

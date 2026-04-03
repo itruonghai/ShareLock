@@ -9,6 +9,7 @@ tensorboard
 datasets
 hf_transfer
 webdataset
+pandas
 
 # Install from GitHub
 git+https://github.com/JonaRuthardt/featureutils.git

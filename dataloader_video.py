@@ -617,3 +617,224 @@ if __name__ == "__main__":
         print("sample:     ", batch["texts"][0])
         print("multi_pos:  ", batch["multi_positives"][0])
         break
+
+
+# ---------------------------------------------------------------------------
+# Multi-clip decoder: one av.open per source video
+# ---------------------------------------------------------------------------
+
+def decode_clips_from_video(
+    video_path: str,
+    clips: list,
+    sampling_cfg: SamplingConfig,
+) -> list:
+    """
+    Open *video_path* once and decode all clips in a single pass.
+
+    Clips are sorted by timestamp before decoding so seeks are always forward
+    (backward seeks are much slower for most codecs).
+
+    Args:
+        video_path:   Path to the source video file.
+        clips:        List of sample dicts, each with:
+                        "key"            – feature-store key (returned as-is)
+                        "timestamp"      – midpoint of clip in seconds
+                        "clip_duration"  – exact clip length in seconds
+                        "video_duration" – safe upper bound for clamping
+        sampling_cfg: Shared SamplingConfig (num_frames, frame_size).
+                      clip_duration is overridden per-clip from the sample dict.
+
+    Returns:
+        List of (frames_tensor_or_None, key) in timestamp-sorted order.
+        frames_tensor: [T, C, H, W] float32 on CPU, or None on decode failure.
+    """
+    clips = sorted(clips, key=lambda s: s["timestamp"])
+
+    tfm = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((sampling_cfg.frame_size, sampling_cfg.frame_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    results = []
+    container = None
+    try:
+        container = av.open(video_path)
+        stream    = container.streams.video[0]
+        vid_dur   = float(stream.duration * stream.time_base)
+        time_base = float(stream.time_base)
+
+        for clip in clips:
+            key      = clip["key"]
+            clip_dur = clip.get("clip_duration", sampling_cfg.clip_duration)
+            ts       = clip["timestamp"]
+
+            half    = clip_dur / 2.0
+            t_start = max(0.0,    ts - half)
+            t_end   = min(vid_dur, ts + half)
+
+            if t_end <= t_start:
+                results.append((None, key))
+                continue
+
+            sample_times = np.linspace(t_start, t_end, sampling_cfg.num_frames)
+            frames: list = []
+            prev_frame   = None
+
+            for t in sample_times:
+                t   = float(np.clip(t, 0.0, vid_dur - 1e-4))
+                pts = int(t / time_base)
+                try:
+                    container.seek(pts, stream=stream, any_frame=False)
+                    for frame in container.decode(video=0):
+                        if frame.pts is not None and frame.pts < pts:
+                            continue
+                        tensor = tfm(frame.to_ndarray(format="rgb24"))
+                        frames.append(tensor)
+                        prev_frame = tensor
+                        break
+                except Exception:
+                    if prev_frame is not None:
+                        frames.append(prev_frame)
+
+            # Pad with last frame if some timestamps failed to decode
+            while len(frames) < sampling_cfg.num_frames:
+                if frames:
+                    frames.append(frames[-1])
+                else:
+                    break
+
+            if not frames:
+                results.append((None, key))
+            else:
+                results.append((torch.stack(frames[:sampling_cfg.num_frames]), key))
+
+    except Exception as e:
+        print(f"[WARN] decode_clips_from_video failed for {video_path}: {e}")
+        decoded = {r[1] for r in results}
+        for clip in clips:
+            if clip["key"] not in decoded:
+                results.append((None, clip["key"]))
+    finally:
+        if container is not None:
+            container.close()
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Ego4D egovid-5m annotation loader
+# ---------------------------------------------------------------------------
+
+def load_ego4d_annotations(
+    csv_file: str,
+    video_root: str,          # e.g. ego4d/v2/video_540ss
+    split_file: Optional[str] = None,   # optional text file with allowed video_ids
+) -> list:
+    """
+    Parse an Ego4D egovid CSV and return a flat list of samples, one per clip.
+
+    video_id format: {VideoID}_{StartFrame}_{EndFrame}
+      - VideoID    → source video filename ({VideoID}.mp4 in video_root/)
+      - StartFrame → first frame index of the clip
+      - EndFrame   → last frame index of the clip
+
+    Required CSV columns: video_id, llava_cap, frame_num, fps
+
+    Each sample dict:
+    {
+      "key":            str,    # full video_id (unique per clip, feature-store key)
+      "video_id":       str,    # same as key
+      "video_path":     str,    # absolute path to source video ({VideoID}.mp4)
+      "text":           str,    # llava_cap caption
+      "video_duration": float,  # safe upper bound (end_time + 10 s) — avoids
+                                #   opening the video just to read duration
+      "timestamp":      float,  # mid-point of clip in source video (seconds)
+      "clip_duration":  float,  # frame_num / fps  (exact clip length)
+    }
+
+    The "key" field lets VideoClipDataset use video_id directly instead of the
+    EgoExo4D frame-accurate make_key computation.
+    The "clip_duration" override causes VideoClipDataset to sample across the
+    exact clip window rather than the global cfg.clip_duration.
+    """
+    import pandas as pd
+
+    df = pd.read_csv(csv_file)
+    n_total = len(df)
+    df = df.dropna(subset=["video_id", "llava_cap", "frame_num", "fps"])
+    df["video_id"]  = df["video_id"].astype(str)
+    df["frame_num"] = df["frame_num"].astype(int)
+    df["fps"]       = df["fps"].astype(float)
+
+    # Optional allow-list filter (one video_id per line)
+    allowed: Optional[set] = None
+    if split_file is not None:
+        with open(split_file) as f:
+            allowed = {line.strip() for line in f if line.strip()}
+        print(f"[Ego4D] Split filter: {len(allowed)} video IDs from {split_file}")
+
+    video_dir = Path(video_root)
+    samples   = []
+    n_missing = 0
+    n_skipped = 0
+
+    for _, row in df.iterrows():
+        vid_id = row["video_id"]
+
+        bare = vid_id.removesuffix(".mp4")   # normalise early; bare = VideoID_Start_End
+
+        if allowed is not None and bare not in allowed and vid_id not in allowed:
+            continue
+
+        # Parse VideoID_StartFrame_EndFrame (CSV may include .mp4 suffix)
+
+        parts = bare.rsplit("_", 2)
+        if len(parts) != 3:
+            n_skipped += 1
+            continue
+        try:
+            source_id   = parts[0]
+            start_frame = int(parts[1])
+            end_frame   = int(parts[2])
+        except ValueError:
+            n_skipped += 1
+            continue
+
+        video_path = video_dir / (source_id + ".mp4")
+        if not video_path.exists():
+            n_missing += 1
+            continue
+
+        fps           = float(row["fps"])
+        frame_num     = int(row["frame_num"])
+        start_time    = start_frame / fps
+        end_time      = end_frame   / fps
+        clip_duration = frame_num   / fps
+        timestamp     = (start_time + end_time) / 2.0
+
+        if clip_duration < 0.1:
+            n_skipped += 1
+            continue
+
+        # video_duration: safe upper bound so sample_frames_centered never
+        # clamps our [start_time, end_time] window inward.
+        video_duration = end_time + 10.0
+
+        samples.append({
+            "key":            bare,    # VideoID_StartFrame_EndFrame, no .mp4
+            "video_id":       bare,
+            "video_path":     str(video_path),
+            "text":           str(row["llava_cap"]).strip(),
+            "video_duration": video_duration,
+            "timestamp":      timestamp,
+            "clip_duration":  clip_duration,
+        })
+
+    print(
+        f"[Ego4D] CSV rows: {n_total}  valid: {len(df)}  "
+        f"loaded: {len(samples)}  "
+        f"missing on disk: {n_missing}  skipped (bad format): {n_skipped}"
+    )
+    return samples
