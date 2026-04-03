@@ -660,6 +660,16 @@ def decode_clips_from_video(
     try:
         container = av.open(video_path)
         stream    = container.streams.video[0]
+
+        # Speed-up: skip B-frames (bidirectional, most expensive to decode).
+        # B-frames need both forward and backward reference frames; skipping them
+        # avoids that cost. For feature extraction the quality difference is negligible.
+        stream.codec_context.skip_frame  = "BIDIR"
+        # Multi-threaded decode within each worker (2 threads per stream is
+        # conservative; keeps total threads reasonable with num_workers=16+).
+        stream.codec_context.thread_type  = "AUTO"
+        stream.codec_context.thread_count = 2
+
         vid_dur   = float(stream.duration * stream.time_base)
         time_base = float(stream.time_base)
         fps       = float(stream.average_rate) or 30.0
