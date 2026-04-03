@@ -386,15 +386,20 @@ def extract_video_ego4d(rank: int, num_gpus: int, samples: list, args) -> None:
 
                 # ── Periodic bottleneck report ────────────────────────────
                 if _n_vids_done % _PROFILE_EVERY == 0 and _n_flushes > 0:
-                    avg_gpu_ms = _t_gpu_total / _n_flushes * 1000
-                    avg_io_ms  = _t_io_total  / _n_vids_done * 1000
-                    ms_per_clip_gpu = avg_gpu_ms / args.batch_size
+                    avg_gpu_ms        = _t_gpu_total / _n_flushes * 1000
+                    avg_io_wait_ms    = _t_io_total  / _n_vids_done * 1000
+                    ms_per_clip_gpu   = avg_gpu_ms / args.batch_size
+                    # clips_per_vid: how many clips the main thread has processed per video
+                    clips_per_vid     = (len(keys_buf) + _n_flushes * args.batch_size) / max(1, _n_vids_done)
+                    # IO-wait is shared across num_workers running in parallel
+                    ms_per_clip_io_eff = (avg_io_wait_ms / max(1, clips_per_vid)) / args.num_workers
+                    gpu_bound = ms_per_clip_gpu > ms_per_clip_io_eff
                     tqdm.tqdm.write(
-                        f"[Bottleneck @ {_n_vids_done} vids | {_n_flushes} flushes] "
-                        f"avg GPU/flush={avg_gpu_ms:.0f}ms "
-                        f"({ms_per_clip_gpu:.0f}ms/clip) | "
-                        f"avg IO-wait={avg_io_ms:.0f}ms/vid  "
-                        f"→ {'** IO-BOUND **' if avg_io_ms > avg_gpu_ms else '** GPU-BOUND **'}"
+                        f"[Bottleneck @ {_n_vids_done} vids | {_n_flushes} flushes]  "
+                        f"GPU: {avg_gpu_ms:.0f}ms/flush = {ms_per_clip_gpu:.0f}ms/clip | "
+                        f"IO-wait: {avg_io_wait_ms:.0f}ms/vid "
+                        f"(~{ms_per_clip_io_eff:.1f}ms/clip eff. w/ {args.num_workers} workers)  "
+                        f"→ {'** GPU-BOUND **' if gpu_bound else '** IO-BOUND **'}"
                     )
 
                 _fill_window()
