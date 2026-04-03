@@ -320,23 +320,40 @@ def extract_video_ego4d(rank: int, num_gpus: int, samples: list, args) -> None:
         keys_buf.clear()
 
     # ── IO threads decode; main thread encodes on GPU ────────────────────────
+    # Clip-level bar: ticks every clip so progress is visible even while the
+    # first few large source videos are still being decoded by workers.
+    clip_bar = tqdm.tqdm(
+        total=n_clips, desc=f"[GPU {rank}] clips", unit="clip",
+        dynamic_ncols=True,
+    )
+    vid_bar = tqdm.tqdm(
+        total=len(assigned_paths), desc=f"[GPU {rank}] videos", unit="vid",
+        dynamic_ncols=True, position=1, leave=True,
+    )
+
     with ThreadPoolExecutor(max_workers=args.num_workers) as pool:
         futures = {
-            pool.submit(decode_clips_from_video, vpath, groups[vpath], sampling_cfg): vpath
+            pool.submit(decode_clips_from_video, vpath, groups[vpath], sampling_cfg):
+                (vpath, len(groups[vpath]))
             for vpath in assigned_paths
         }
-        for future in tqdm.tqdm(
-            as_completed(futures), total=len(futures),
-            desc=f"[Video GPU {rank}] source videos",
-        ):
-            for frames, key in future.result():
+        for future in as_completed(futures):
+            vpath, n_in_video = futures[future]
+            decoded = future.result()
+            for frames, key in decoded:
                 if frames is None:
+                    clip_bar.update(1)
                     continue
                 frames_buf.append(frames)
                 keys_buf.append(key)
+                clip_bar.update(1)
                 if len(frames_buf) >= args.batch_size:
                     flush()
+            vid_bar.update(1)
+            vid_bar.set_postfix({"last": os.path.basename(vpath)})
 
+    clip_bar.close()
+    vid_bar.close()
     flush()   # remaining partial batch
     feature_utils.save()
     del encoder

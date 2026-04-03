@@ -666,7 +666,8 @@ def decode_clips_from_video(
         vid_dur   = float(stream.duration * stream.time_base)
         time_base = float(stream.time_base)
 
-        for clip in clips:
+        for clip in tqdm.tqdm(clips, desc=os.path.basename(video_path),
+                              unit="clip", leave=False, dynamic_ncols=True):
             key      = clip["key"]
             clip_dur = clip.get("clip_duration", sampling_cfg.clip_duration)
             ts       = clip["timestamp"]
