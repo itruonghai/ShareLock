@@ -729,111 +729,80 @@ def decode_clips_from_video(
 
 def load_ego4d_annotations(
     csv_file: str,
-    video_root: str,          # e.g. ego4d/v2/video_540ss
-    split_file: Optional[str] = None,   # optional text file with allowed video_ids
+    video_root: str,
+    split_file: Optional[str] = None,
 ) -> list:
     """
     Parse an Ego4D egovid CSV and return a flat list of samples, one per clip.
 
-    video_id format: {VideoID}_{StartFrame}_{EndFrame}
-      - VideoID    → source video filename ({VideoID}.mp4 in video_root/)
-      - StartFrame → first frame index of the clip
-      - EndFrame   → last frame index of the clip
-
+    video_id format: {VideoID}_{StartFrame}_{EndFrame}[.mp4]
     Required CSV columns: video_id, llava_cap, frame_num, fps
 
-    Each sample dict:
-    {
-      "key":            str,    # full video_id (unique per clip, feature-store key)
-      "video_id":       str,    # same as key
-      "video_path":     str,    # absolute path to source video ({VideoID}.mp4)
-      "text":           str,    # llava_cap caption
-      "video_duration": float,  # safe upper bound (end_time + 10 s) — avoids
-                                #   opening the video just to read duration
-      "timestamp":      float,  # mid-point of clip in source video (seconds)
-      "clip_duration":  float,  # frame_num / fps  (exact clip length)
-    }
-
-    The "key" field lets VideoClipDataset use video_id directly instead of the
-    EgoExo4D frame-accurate make_key computation.
-    The "clip_duration" override causes VideoClipDataset to sample across the
-    exact clip window rather than the global cfg.clip_duration.
+    Optimised for 5M-row CSVs:
+      - reads only needed columns (usecols)
+      - vectorised string parsing (no per-row Python callbacks)
+      - file-existence check only for unique source videos (~8k instead of 5M)
     """
     import pandas as pd
 
-    df = pd.read_csv(csv_file)
+    needed = ["video_id", "llava_cap", "frame_num", "fps"]
+    df = pd.read_csv(
+        csv_file,
+        usecols=needed,
+        dtype={"video_id": str, "frame_num": "Int32"},
+    )
     n_total = len(df)
-    df = df.dropna(subset=["video_id", "llava_cap", "frame_num", "fps"])
-    df["video_id"]  = df["video_id"].astype(str)
+    df = df.dropna(subset=needed).copy()
     df["frame_num"] = df["frame_num"].astype(int)
     df["fps"]       = df["fps"].astype(float)
 
-    # Optional allow-list filter (one video_id per line)
-    allowed: Optional[set] = None
+    # ── Vectorised parse: strip .mp4, split into source_id / start / end ─────
+    bare   = df["video_id"].str.replace(r"\.mp4$", "", regex=True)
+    parts  = bare.str.rsplit("_", n=2, expand=True)   # cols: 0=VideoID, 1=start, 2=end
+    df["bare"]        = bare
+    df["source_id"]   = parts[0]
+    df["start_frame"] = pd.to_numeric(parts[1], errors="coerce")
+    df["end_frame"]   = pd.to_numeric(parts[2], errors="coerce")
+
+    n_skipped = df["start_frame"].isna().sum()
+    df = df.dropna(subset=["source_id", "start_frame", "end_frame"])
+    df["start_frame"] = df["start_frame"].astype(int)
+    df["end_frame"]   = df["end_frame"].astype(int)
+
+    # ── Optional allow-list filter ────────────────────────────────────────────
     if split_file is not None:
         with open(split_file) as f:
             allowed = {line.strip() for line in f if line.strip()}
-        print(f"[Ego4D] Split filter: {len(allowed)} video IDs from {split_file}")
+        df = df[df["bare"].isin(allowed) | df["video_id"].isin(allowed)]
+        print(f"[Ego4D] Split filter: {len(allowed)} IDs → {len(df)} rows kept")
 
-    video_dir = Path(video_root)
-    samples   = []
-    n_missing = 0
-    n_skipped = 0
+    # ── File-existence check — only for unique source videos (~8k) ────────────
+    video_dir    = Path(video_root)
+    unique_ids   = df["source_id"].unique()
+    exists_map   = {sid: (video_dir / (sid + ".mp4")).exists() for sid in unique_ids}
+    n_missing    = sum(1 for v in exists_map.values() if not v)
+    df           = df[df["source_id"].map(exists_map)]
 
-    for _, row in df.iterrows():
-        vid_id = row["video_id"]
+    # ── Vectorised time computation ───────────────────────────────────────────
+    fps              = df["fps"]
+    start_time       = df["start_frame"] / fps
+    end_time         = df["end_frame"]   / fps
+    df["clip_duration"] = df["frame_num"] / fps
+    df["timestamp"]     = (start_time + end_time) / 2.0
+    df["video_duration"] = end_time + 10.0          # safe upper bound; no av.open needed
+    df["video_path"]    = str(video_dir) + "/" + df["source_id"] + ".mp4"
 
-        bare = vid_id.removesuffix(".mp4")   # normalise early; bare = VideoID_Start_End
+    df = df[df["clip_duration"] >= 0.1]
 
-        if allowed is not None and bare not in allowed and vid_id not in allowed:
-            continue
-
-        # Parse VideoID_StartFrame_EndFrame (CSV may include .mp4 suffix)
-
-        parts = bare.rsplit("_", 2)
-        if len(parts) != 3:
-            n_skipped += 1
-            continue
-        try:
-            source_id   = parts[0]
-            start_frame = int(parts[1])
-            end_frame   = int(parts[2])
-        except ValueError:
-            n_skipped += 1
-            continue
-
-        video_path = video_dir / (source_id + ".mp4")
-        if not video_path.exists():
-            n_missing += 1
-            continue
-
-        fps           = float(row["fps"])
-        frame_num     = int(row["frame_num"])
-        start_time    = start_frame / fps
-        end_time      = end_frame   / fps
-        clip_duration = frame_num   / fps
-        timestamp     = (start_time + end_time) / 2.0
-
-        if clip_duration < 0.1:
-            n_skipped += 1
-            continue
-
-        # video_duration: safe upper bound so sample_frames_centered never
-        # clamps our [start_time, end_time] window inward.
-        video_duration = end_time + 10.0
-
-        samples.append({
-            "key":            bare,    # VideoID_StartFrame_EndFrame, no .mp4
-            "video_id":       bare,
-            "video_path":     str(video_path),
-            "text":           str(row["llava_cap"]).strip(),
-            "video_duration": video_duration,
-            "timestamp":      timestamp,
-            "clip_duration":  clip_duration,
-        })
+    # ── Build output records ──────────────────────────────────────────────────
+    out = df[["bare", "video_path", "llava_cap", "video_duration",
+              "timestamp", "clip_duration"]].copy()
+    out.rename(columns={"bare": "key", "llava_cap": "text"}, inplace=True)
+    out["video_id"] = out["key"]
+    samples = out.to_dict("records")
 
     print(
-        f"[Ego4D] CSV rows: {n_total}  valid: {len(df)}  "
+        f"[Ego4D] CSV rows: {n_total}  parsed: {len(df) + n_missing}  "
         f"loaded: {len(samples)}  "
         f"missing on disk: {n_missing}  skipped (bad format): {n_skipped}"
     )
