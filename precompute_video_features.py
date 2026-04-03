@@ -331,26 +331,42 @@ def extract_video_ego4d(rank: int, num_gpus: int, samples: list, args) -> None:
         dynamic_ncols=True, position=1, leave=True,
     )
 
+    # Submit in sliding-window batches of num_workers to cap live decoded frames.
+    # Submitting all 8k+ videos at once would hold all decoded frame tensors in
+    # memory simultaneously (num_workers active + all completed-but-unread futures).
+    SUBMIT_WINDOW = args.num_workers * 2
+
     with ThreadPoolExecutor(max_workers=args.num_workers) as pool:
-        futures = {
-            pool.submit(decode_clips_from_video, vpath, groups[vpath], sampling_cfg):
-                (vpath, len(groups[vpath]))
-            for vpath in assigned_paths
-        }
-        for future in as_completed(futures):
-            vpath, n_in_video = futures[future]
-            decoded = future.result()
-            for frames, key in decoded:
-                if frames is None:
+        pending: dict = {}   # future -> (vpath, n_clips)
+        path_iter = iter(assigned_paths)
+
+        def _fill_window():
+            while len(pending) < SUBMIT_WINDOW:
+                try:
+                    vpath = next(path_iter)
+                except StopIteration:
+                    break
+                f = pool.submit(decode_clips_from_video, vpath, groups[vpath], sampling_cfg)
+                pending[f] = (vpath, len(groups[vpath]))
+
+        _fill_window()
+        while pending:
+            for future in as_completed(pending):
+                vpath, n_in_video = pending.pop(future)
+                decoded = future.result()
+                for frames, key in decoded:
+                    if frames is None:
+                        clip_bar.update(1)
+                        continue
+                    frames_buf.append(frames)
+                    keys_buf.append(key)
                     clip_bar.update(1)
-                    continue
-                frames_buf.append(frames)
-                keys_buf.append(key)
-                clip_bar.update(1)
-                if len(frames_buf) >= args.batch_size:
-                    flush()
-            vid_bar.update(1)
-            vid_bar.set_postfix({"last": os.path.basename(vpath)})
+                    if len(frames_buf) >= args.batch_size:
+                        flush()
+                vid_bar.update(1)
+                vid_bar.set_postfix({"last": os.path.basename(vpath)})
+                _fill_window()
+                break   # re-enter as_completed with updated pending
 
     clip_bar.close()
     vid_bar.close()

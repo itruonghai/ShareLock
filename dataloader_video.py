@@ -670,10 +670,16 @@ def decode_clips_from_video(
         stream.codec_context.thread_type  = "AUTO"
         stream.codec_context.thread_count = 2
 
-        vid_dur   = float(stream.duration * stream.time_base)
+        # stream.duration can be None for poorly-muxed files; fall back to container.
+        raw_dur   = stream.duration if stream.duration else (
+                        container.duration // av.time_base if container.duration else None)
         time_base = float(stream.time_base)
+        vid_dur   = float(raw_dur * time_base) if raw_dur else 3600.0  # 1h safe fallback
         fps       = float(stream.average_rate) or 30.0
-        half_frame = 0.5 / fps   # tolerance: accept frame within ±half_frame of target
+        # With skip_frame="BIDIR" the effective frame spacing is up to 3× the nominal
+        # interval (e.g. I,B,B,P → only I/P decoded, gap ≈ 3/fps).  Use a wider
+        # tolerance (1.5 frames) so targets between P-frames still get assigned.
+        half_frame = 1.5 / fps
 
         # ── Build sorted list of (time, clip_idx, slot_idx) for all targets ──
         clip_sample_times: list = []   # per clip: np.array or None
@@ -851,8 +857,10 @@ def load_ego4d_annotations(
         for sid in tqdm.tqdm(unique_ids, desc="[Ego4D] Checking source videos",
                              unit="video", leave=False)
     }
-    n_missing = sum(1 for v in exists_map.values() if not v)
-    df        = df[df["source_id"].map(exists_map)]
+    n_missing   = sum(1 for v in exists_map.values() if not v)
+    n_clips_missing = int(df["source_id"].map(lambda s: not exists_map[s]).sum())
+    df          = df[df["source_id"].map(exists_map)]
+    n_after_exists = len(df)
 
     # ── Vectorised time computation ───────────────────────────────────────────
     fps              = df["fps"]
@@ -864,17 +872,19 @@ def load_ego4d_annotations(
     df["video_path"]    = str(video_dir) + "/" + df["source_id"] + ".mp4"
 
     df = df[df["clip_duration"] >= 0.1]
+    n_short = n_after_exists - len(df)
 
     # ── Build output records ──────────────────────────────────────────────────
     out = df[["bare", "video_path", "llava_cap", "video_duration",
               "timestamp", "clip_duration"]].copy()
     out.rename(columns={"bare": "key", "llava_cap": "text"}, inplace=True)
-    out["video_id"] = out["key"]
     samples = out.to_dict("records")
 
     print(
-        f"[Ego4D] CSV rows: {n_total}  parsed: {len(df) + n_missing}  "
-        f"loaded: {len(samples)}  "
-        f"missing on disk: {n_missing}  skipped (bad format): {n_skipped}"
+        f"[Ego4D] CSV rows      : {n_total:,}\n"
+        f"[Ego4D] Bad format    : {n_skipped:,}\n"
+        f"[Ego4D] Missing videos: {n_missing} source files ({n_clips_missing:,} clips)\n"
+        f"[Ego4D] Too short (<0.1s): {n_short:,}\n"
+        f"[Ego4D] Loaded        : {len(samples):,} clips ready"
     )
     return samples
