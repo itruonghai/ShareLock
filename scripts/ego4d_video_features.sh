@@ -16,7 +16,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
 #SBATCH --gres=gpu:1
-#SBATCH --time=48:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=logs/%j_video.out
 #SBATCH --error=logs/%j_video.err
 
@@ -64,7 +64,7 @@ python precompute_video_features.py \
     --output_dir "$OUTPUT_DIR" \
     --extract    video \
     --num_gpus   1 \
-    --batch_size 16 \
+    --batch_size 192 \
     --num_workers 8
 
 echo "========================================"
