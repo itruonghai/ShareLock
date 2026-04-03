@@ -32,15 +32,23 @@ def check_split(ego4d_root: Path, csv_file: Path, split_name: str, save_missing:
         print(f"[ERROR] CSV not found: {csv_file}")
         return []
 
-    # ── Read only the columns we need ────────────────────────────────────────
-    needed = ["video_id", "llava_cap", "frame_num", "fps"]
-    t0 = time.time()
-    df = pd.read_csv(
-        csv_file,
-        usecols=needed,
-        dtype={"video_id": str, "frame_num": "Int32"},
-    )
+    # ── Read CSV in chunks so tqdm can show progress during the 30-40s read ──
+    needed    = ["video_id", "llava_cap", "frame_num", "fps"]
+    CHUNKSIZE = 200_000
+    chunks    = []
+    with tqdm.tqdm(desc="Reading CSV", unit=" rows", unit_scale=True,
+                   dynamic_ncols=True) as pbar:
+        t0 = time.time()
+        for chunk in pd.read_csv(
+            csv_file, usecols=needed,
+            dtype={"video_id": str, "frame_num": "Int32"},
+            chunksize=CHUNKSIZE,
+        ):
+            chunks.append(chunk)
+            pbar.update(len(chunk))
+    df = pd.concat(chunks, ignore_index=True)
     print(f"Total rows in CSV : {len(df):,}  ({time.time()-t0:.1f}s)")
+    del chunks
 
     for col in needed:
         n = df[col].isna().sum()
@@ -50,17 +58,18 @@ def check_split(ego4d_root: Path, csv_file: Path, split_name: str, save_missing:
     df = df.dropna(subset=needed).copy()
     df["frame_num"] = df["frame_num"].astype(int)
     df["fps"]       = df["fps"].astype(float)
-    print(f"Valid rows        : {len(df)}")
+    print(f"Valid rows        : {len(df):,}")
 
     # ── Vectorised parse: VideoID_StartFrame_EndFrame[.mp4] ──────────────────
-    t0 = time.time()
-    bare = df["video_id"].str.replace(r"\.mp4$", "", regex=True)
-    parts = bare.str.rsplit("_", n=2, expand=True)   # columns 0, 1, 2
-    df["source_id"]   = parts[0]
-    df["start_frame"] = pd.to_numeric(parts[1], errors="coerce")
-    df["end_frame"]   = pd.to_numeric(parts[2], errors="coerce")
-
-    print(f"Parsed video_ids  : {time.time()-t0:.1f}s", flush=True)
+    with tqdm.tqdm(total=4, desc="Parsing video_ids", unit="step",
+                   dynamic_ncols=True) as pbar:
+        t0   = time.time()
+        bare = df["video_id"].str.replace(r"\.mp4$", "", regex=True); pbar.update(1)
+        parts = bare.str.rsplit("_", n=2, expand=True);               pbar.update(1)
+        df["source_id"]   = parts[0];                                 pbar.update(1)
+        df["start_frame"] = pd.to_numeric(parts[1], errors="coerce")
+        df["end_frame"]   = pd.to_numeric(parts[2], errors="coerce"); pbar.update(1)
+    print(f"Parsed video_ids  : {time.time()-t0:.1f}s")
     n_unparsed = df["start_frame"].isna().sum()
     if n_unparsed:
         print(f"[WARN] {n_unparsed} video_ids could not be parsed as "
@@ -93,7 +102,7 @@ def check_split(ego4d_root: Path, csv_file: Path, split_name: str, save_missing:
 
     disk_files = {
         p.stem for p in tqdm.tqdm(
-            video_dir.iterdir(), desc="Scanning disk", unit="file", leave=False
+            video_dir.iterdir(), desc="Scanning disk", unit="file", dynamic_ncols=True
         ) if p.suffix == ".mp4"
     }
     source_ids_in_csv = set(df_p["source_id"].unique())

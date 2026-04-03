@@ -749,28 +749,37 @@ def load_ego4d_annotations(
     import pandas as pd
 
     needed = ["video_id", "llava_cap", "frame_num", "fps"]
-    print(f"[Ego4D] Reading CSV: {csv_file}", flush=True)
+    CHUNKSIZE = 200_000
+    chunks: list = []
     t0 = time.time()
-    df = pd.read_csv(
-        csv_file,
-        usecols=needed,
-        dtype={"video_id": str, "frame_num": "Int32"},
-    )
-    print(f"[Ego4D] CSV read: {len(df):,} rows in {time.time()-t0:.1f}s", flush=True)
-
+    with tqdm.tqdm(desc="[Ego4D] Reading CSV", unit=" rows", unit_scale=True,
+                   dynamic_ncols=True) as pbar:
+        for chunk in pd.read_csv(
+            csv_file, usecols=needed,
+            dtype={"video_id": str, "frame_num": "Int32"},
+            chunksize=CHUNKSIZE,
+        ):
+            chunks.append(chunk)
+            pbar.update(len(chunk))
+    df = pd.concat(chunks, ignore_index=True)
+    del chunks
     n_total = len(df)
+    print(f"[Ego4D] CSV read: {n_total:,} rows in {time.time()-t0:.1f}s", flush=True)
+
     df = df.dropna(subset=needed).copy()
     df["frame_num"] = df["frame_num"].astype(int)
     df["fps"]       = df["fps"].astype(float)
 
     # ── Vectorised parse: strip .mp4, split into source_id / start / end ─────
-    t0 = time.time()
-    bare   = df["video_id"].str.replace(r"\.mp4$", "", regex=True)
-    parts  = bare.str.rsplit("_", n=2, expand=True)   # cols: 0=VideoID, 1=start, 2=end
-    df["bare"]        = bare
-    df["source_id"]   = parts[0]
-    df["start_frame"] = pd.to_numeric(parts[1], errors="coerce")
-    df["end_frame"]   = pd.to_numeric(parts[2], errors="coerce")
+    with tqdm.tqdm(total=4, desc="[Ego4D] Parsing video_ids", unit="step",
+                   dynamic_ncols=True) as pbar:
+        t0    = time.time()
+        bare  = df["video_id"].str.replace(r"\.mp4$", "", regex=True); pbar.update(1)
+        parts = bare.str.rsplit("_", n=2, expand=True);                pbar.update(1)
+        df["bare"]        = bare
+        df["source_id"]   = parts[0];                                  pbar.update(1)
+        df["start_frame"] = pd.to_numeric(parts[1], errors="coerce")
+        df["end_frame"]   = pd.to_numeric(parts[2], errors="coerce");  pbar.update(1)
     print(f"[Ego4D] Parsed video_ids in {time.time()-t0:.1f}s", flush=True)
 
     n_skipped = df["start_frame"].isna().sum()
