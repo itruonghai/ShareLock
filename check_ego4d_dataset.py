@@ -15,9 +15,11 @@ Usage:
 """
 
 import argparse
+import time
 from pathlib import Path
 
 import pandas as pd
+import tqdm
 
 
 def check_split(ego4d_root: Path, csv_file: Path, split_name: str, save_missing: bool = False):
@@ -32,12 +34,13 @@ def check_split(ego4d_root: Path, csv_file: Path, split_name: str, save_missing:
 
     # ── Read only the columns we need ────────────────────────────────────────
     needed = ["video_id", "llava_cap", "frame_num", "fps"]
+    t0 = time.time()
     df = pd.read_csv(
         csv_file,
         usecols=needed,
         dtype={"video_id": str, "frame_num": "Int32"},
     )
-    print(f"Total rows in CSV : {len(df)}")
+    print(f"Total rows in CSV : {len(df):,}  ({time.time()-t0:.1f}s)")
 
     for col in needed:
         n = df[col].isna().sum()
@@ -50,12 +53,14 @@ def check_split(ego4d_root: Path, csv_file: Path, split_name: str, save_missing:
     print(f"Valid rows        : {len(df)}")
 
     # ── Vectorised parse: VideoID_StartFrame_EndFrame[.mp4] ──────────────────
+    t0 = time.time()
     bare = df["video_id"].str.replace(r"\.mp4$", "", regex=True)
     parts = bare.str.rsplit("_", n=2, expand=True)   # columns 0, 1, 2
     df["source_id"]   = parts[0]
     df["start_frame"] = pd.to_numeric(parts[1], errors="coerce")
     df["end_frame"]   = pd.to_numeric(parts[2], errors="coerce")
 
+    print(f"Parsed video_ids  : {time.time()-t0:.1f}s", flush=True)
     n_unparsed = df["start_frame"].isna().sum()
     if n_unparsed:
         print(f"[WARN] {n_unparsed} video_ids could not be parsed as "
@@ -86,7 +91,11 @@ def check_split(ego4d_root: Path, csv_file: Path, split_name: str, save_missing:
         print(f"\n[ERROR] Video directory not found: {video_dir}")
         return []
 
-    disk_files       = {p.stem for p in video_dir.iterdir() if p.suffix == ".mp4"}
+    disk_files = {
+        p.stem for p in tqdm.tqdm(
+            video_dir.iterdir(), desc="Scanning disk", unit="file", leave=False
+        ) if p.suffix == ".mp4"
+    }
     source_ids_in_csv = set(df_p["source_id"].unique())
     print(f"\nSource video files on disk : {len(disk_files)}")
     print(f"Unique source videos in CSV: {len(source_ids_in_csv)}")

@@ -52,6 +52,7 @@ from typing import Optional
 import av
 import numpy as np
 import torch
+import tqdm
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 
@@ -743,26 +744,33 @@ def load_ego4d_annotations(
       - vectorised string parsing (no per-row Python callbacks)
       - file-existence check only for unique source videos (~8k instead of 5M)
     """
+    import time
     import pandas as pd
 
     needed = ["video_id", "llava_cap", "frame_num", "fps"]
+    print(f"[Ego4D] Reading CSV: {csv_file}", flush=True)
+    t0 = time.time()
     df = pd.read_csv(
         csv_file,
         usecols=needed,
         dtype={"video_id": str, "frame_num": "Int32"},
     )
+    print(f"[Ego4D] CSV read: {len(df):,} rows in {time.time()-t0:.1f}s", flush=True)
+
     n_total = len(df)
     df = df.dropna(subset=needed).copy()
     df["frame_num"] = df["frame_num"].astype(int)
     df["fps"]       = df["fps"].astype(float)
 
     # ── Vectorised parse: strip .mp4, split into source_id / start / end ─────
+    t0 = time.time()
     bare   = df["video_id"].str.replace(r"\.mp4$", "", regex=True)
     parts  = bare.str.rsplit("_", n=2, expand=True)   # cols: 0=VideoID, 1=start, 2=end
     df["bare"]        = bare
     df["source_id"]   = parts[0]
     df["start_frame"] = pd.to_numeric(parts[1], errors="coerce")
     df["end_frame"]   = pd.to_numeric(parts[2], errors="coerce")
+    print(f"[Ego4D] Parsed video_ids in {time.time()-t0:.1f}s", flush=True)
 
     n_skipped = df["start_frame"].isna().sum()
     df = df.dropna(subset=["source_id", "start_frame", "end_frame"])
@@ -777,11 +785,15 @@ def load_ego4d_annotations(
         print(f"[Ego4D] Split filter: {len(allowed)} IDs → {len(df)} rows kept")
 
     # ── File-existence check — only for unique source videos (~8k) ────────────
-    video_dir    = Path(video_root)
-    unique_ids   = df["source_id"].unique()
-    exists_map   = {sid: (video_dir / (sid + ".mp4")).exists() for sid in unique_ids}
-    n_missing    = sum(1 for v in exists_map.values() if not v)
-    df           = df[df["source_id"].map(exists_map)]
+    video_dir  = Path(video_root)
+    unique_ids = df["source_id"].unique()
+    exists_map = {
+        sid: (video_dir / (sid + ".mp4")).exists()
+        for sid in tqdm.tqdm(unique_ids, desc="[Ego4D] Checking source videos",
+                             unit="video", leave=False)
+    }
+    n_missing = sum(1 for v in exists_map.values() if not v)
+    df        = df[df["source_id"].map(exists_map)]
 
     # ── Vectorised time computation ───────────────────────────────────────────
     fps              = df["fps"]
