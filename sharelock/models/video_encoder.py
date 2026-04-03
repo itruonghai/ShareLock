@@ -133,7 +133,11 @@ class VideoEncoder(nn.Module):
         """
         # V-JEPA-2 encoder expects [B, C, T, H, W]
         x = frames.permute(0, 2, 1, 3, 4)   # [B, T, C, H, W] → [B, C, T, H, W]
-        # Model outputs all patch tokens: [B, num_tokens, dim]
-        tokens = self.model(x)
+        # Use bf16 autocast for ~2–4× speedup on NVIDIA tensor cores (Volta+).
+        # bf16 has the same exponent range as fp32 so ViT activations stay stable.
+        # Output is cast back to float32 so downstream projectors are unaffected.
+        with torch.autocast(x.device.type, dtype=torch.bfloat16):
+            # Model outputs all patch tokens: [B, num_tokens, dim]
+            tokens = self.model(x)
         # Mean-pool all tokens → [B, dim]; cast to float32 for downstream projector
         return tokens.mean(dim=1).float()

@@ -64,8 +64,8 @@ python precompute_video_features.py \
     --output_dir "$OUTPUT_DIR" \
     --extract    video \
     --num_gpus   1 \
-    --batch_size 8 \
-    --num_workers 16
+    --batch_size 16 \
+    --num_workers 8
 
 echo "========================================"
 echo "Finished : $(date)"

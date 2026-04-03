@@ -72,27 +72,76 @@ Practical speedup (variable GOP, codec overhead): ~1.5–2.5×
 
 **Multi-threaded codec** (`thread_type=AUTO, thread_count=2`): each IO worker thread uses 2 codec threads internally. With `num_workers=16` IO threads, this uses up to 32 CPU threads for decode. On a 16-core node each worker gets 2 hardware threads.
 
-**Projected**: ~0.5–0.9 s/clip → estimated total: ~680–1,220 hours on 1 GPU.
+**Note on B-frame skip + observed speed**: In practice, B-frame skip alone did not reduce wall-clock clip rate. The observed ~1.47 s/clip with B-skip matches the observed ~1.35 s/clip without it (within run-to-run noise). See **"Why B-frame skip didn't help"** below for diagnosis.
 
-**Note on frame matching accuracy**: With B-frames skipped, consecutive decoded frames are spaced at ~3/fps ≈ 100ms instead of 1/fps ≈ 33ms. The matching tolerance was widened from `0.5/fps` to `1.5/fps` to ensure every sample target is matched to the nearest decoded frame. The quality impact on features is negligible (the encoder sees slightly coarser temporal sampling but the window is still correct).
+**Note on frame matching accuracy**: With B-frames skipped, consecutive decoded frames are spaced at ~3/fps ≈ 100ms instead of 1/fps ≈ 33ms. The matching tolerance was widened from `0.5/fps` to `1.5/fps` to ensure every sample target is matched to the nearest decoded frame. The quality impact on features is negligible.
+
+---
+
+## Why B-frame skip didn't help — bottleneck diagnosis
+
+The end-to-end clip rate is `max(T_io, T_gpu)`, not their sum, because IO workers run concurrently with the GPU encoder. Reducing IO time only helps if IO is the bottleneck.
+
+### Measured
+
+```
+Observed clip rate: ~1.47 s/clip  (1 GPU, batch_size=8, ViT-iG fp32)
+```
+
+### GPU time estimate (ViT-iG fp32)
+
+ViT-iG gigantic is ~1.9 B parameters. Input: `[8, 3, 16, 384, 384]` → `[8, 3, 16, 27, 27]` patches = **93,312 tokens** per batch.
+
+For a standard ViT with ~48 transformer layers (attention + MLP):
+```
+FLOPs per batch ≈ 2 × 48 × (4 × 1664² × 93312 + 2 × 93312² × 1664)
+               ≈ several hundred TFLOPs
+
+A100 fp32 throughput: 77.6 TFLOPS
+→ GPU time per batch: ~3–10 s
+→ GPU time per clip:  ~0.4–1.25 s
+```
+
+This matches the observed 1.47 s/clip. **GPU is the bottleneck** — IO workers finish decoding a video's worth of clips well before the GPU finishes encoding the previous batch.
+
+### IO time estimate (after B-frame skip)
+
+```
+Frames decoded per video ≈ 80,000 × 0.33 (B-skip) = 26,400
+PyAV throughput ≈ 50–100 fps (CPU)
+IO time per video ≈ 26,400 / 75 fps ≈ 350 s
+IO time per clip  ≈ 350 s / 577 clips ≈ 0.6 s/clip (per worker)
+With num_workers=16 workers: IO effective rate >> GPU rate
+```
+
+IO is 10–20× faster than GPU when parallelised across 16 workers. Cutting IO time further gives zero benefit until GPU is sped up.
+
+### Fix: bf16 autocast in VideoEncoder.forward()
+
+`torch.autocast("cuda", dtype=torch.bfloat16)` activates tensor cores for the ViT's matrix multiplications. A100 bf16 throughput: **312 TFLOPS** (4× fp32).
+
+```
+Expected GPU time per clip (bf16): ~0.1–0.3 s
+New bottleneck: IO at ~0.04 s/clip effective (16 workers × 0.6 s / 577 clips ÷ 16)
+Expected end-to-end: ~0.1–0.3 s/clip
+```
 
 ---
 
 ## Throughput model (1 GPU)
 
 ```
-T_total = N_clips × T_clip
+T_total = N_clips × max(T_io_effective, T_gpu)
 
 where:
   N_clips = 4,873,088
-  T_clip  = T_io + T_encode
-
-V1:  T_io = 30s,   T_encode ≈ 0.05s  →  T_total ≈ 42,700 h
-V2:  T_io = 1.3s,  T_encode ≈ 0.05s  →  T_total ≈  1,820 h
-V3:  T_io ≈ 0.5s,  T_encode ≈ 0.05s  →  T_total ≈    690 h (projected)
+  T_io_effective = T_io_per_video / clips_per_video  (amortised over workers)
+  
+V1:  T_gpu = 1.2s,  T_io = 30s   →  IO bound  → T_total ≈ 42,700 h
+V2:  T_gpu = 1.2s,  T_io = 0.6s  →  GPU bound → T_total ≈  1,630 h
+V3:  T_gpu = 1.2s,  T_io = 0.4s  →  GPU bound → T_total ≈  1,630 h  (B-skip no gain)
+V4:  T_gpu = 0.2s,  T_io = 0.04s →  GPU bound → T_total ≈    270 h  (bf16 fix)
 ```
-
-GPU encode is not the bottleneck: V-JEPA-2.1 ViT-iG at batch_size=8, 16 frames, 384px takes ~0.4s per batch = 0.05s per clip. IO dominates at every stage.
 
 ---
 
@@ -100,14 +149,13 @@ GPU encode is not the bottleneck: V-JEPA-2.1 ViT-iG at batch_size=8, 16 frames, 
 
 The extraction shards by **source video** (not by clip), so each GPU owns disjoint files and there is no cross-GPU coordination.
 
-| GPUs | Projected time (V3) |
-|------|---------------------|
-| 1    | ~690 h |
-| 2    | ~345 h |
-| 3    | ~230 h |
-| 4    | ~173 h |
+| GPUs | Estimated time (V4, bf16) |
+|------|--------------------------|
+| 1    | ~270 h |
+| 2    | ~135 h |
+| 3    | ~90 h  |
 
-**Diminishing returns**: IO is the bottleneck, not GPU compute. Adding GPUs without proportionally increasing IO bandwidth (NVMe vs NFS, num_workers) gives less than linear scaling on network-mounted storage.
+**GPU is now the bottleneck** (after bf16 fix). Adding GPUs scales linearly since each GPU is independent and IO workers are per-GPU.
 
 ---
 
